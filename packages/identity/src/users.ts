@@ -884,31 +884,38 @@ export function createUserService(options: UserServiceOptions): UserService {
             current === null ||
             current.principalId !== requestedPrincipal ||
             current.principalHash !== ownerHash ||
-            current.email !== newEmail ||
-            current.emailHash !== newEmailHash ||
             current.status !== "active" ||
-            !current.emailVerified ||
-            (current.emailChangeOperationHash !== operationHash &&
-              current.emailChangeOperationHash !== null)
+            !current.emailVerified
           ) {
             return { action: "keep" };
           }
-          return current.emailChangeOperationHash === null
-            ? { action: "keep" }
-            : {
-                action: "write",
-                value: {
-                  ...current,
-                  emailChangeOperationHash: null,
-                  updatedAt: now,
-                },
-              };
+          if (current.emailChangeOperationHash === null) {
+            return { action: "keep" };
+          }
+          if (
+            current.emailChangeOperationHash !== operationHash ||
+            current.email !== newEmail ||
+            current.emailHash !== newEmailHash
+          ) {
+            return { action: "keep" };
+          }
+          return {
+            action: "write",
+            value: {
+              ...current,
+              emailChangeOperationHash: null,
+              updatedAt: now,
+            },
+          };
         },
         { maxAttempts: 10 },
       );
       if (
         finalized.value === null ||
-        finalized.value.emailHash !== newEmailHash ||
+        finalized.value.principalId !== requestedPrincipal ||
+        finalized.value.principalHash !== ownerHash ||
+        finalized.value.status !== "active" ||
+        !finalized.value.emailVerified ||
         finalized.value.emailChangeOperationHash !== null
       ) {
         throw new IdentityError(

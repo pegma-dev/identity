@@ -1793,6 +1793,106 @@ describe.each([
       }),
     ).resolves.toBeNull();
   });
+
+  it("retains a superseded handoff until the newer marker finalizes", async () => {
+    let now = "2026-07-28T12:00:00.000Z" as IsoTimestamp;
+    const failing = failEmailChangeClearOnce(makeStore());
+    const { identity, protector, store } = fixture(failing.store, {
+      clock: { now: () => now },
+      retentionMs: 1,
+      newId: () => randomUUID(),
+    });
+    const suffix = _name.toLowerCase();
+    const principalId = `superseded-${_name}` as PrincipalId;
+    await identity.provisionVerifiedUser({
+      principalId,
+      email: `superseded-a-${suffix}@example.test`,
+    });
+    const first = await identity.beginEmailChange(
+      principalId,
+      `superseded-b-${suffix}@example.test`,
+      "first",
+    );
+    await identity.finishEmailChange({
+      principalId,
+      codeHandle: first.codeHandle,
+      code: await codeFor(protector, first.codeHandle),
+      rateLimitKey: "first",
+    });
+    const firstHash = await emailCodeHandleHash(first.codeHandle);
+    const firstPartition = `email-operation-${firstHash}`;
+
+    now = "2026-07-28T12:01:00.000Z" as IsoTimestamp;
+    const second = await identity.beginEmailChange(
+      principalId,
+      `superseded-c-${suffix}@example.test`,
+      "second",
+    );
+    const secondHash = await emailCodeHandleHash(second.codeHandle);
+    failing.arm();
+    await expect(
+      identity.finishEmailChange({
+        principalId,
+        codeHandle: second.codeHandle,
+        code: await codeFor(protector, second.codeHandle),
+        rateLimitKey: "second",
+      }),
+    ).rejects.toThrow("simulated loss before claim clear");
+
+    const operations = store.collection(emailOperationsCollection);
+    for (const row of await operations.listVersioned(firstPartition)) {
+      if (row.value.kind === "mail") {
+        await operations.deleteIfUnchanged(
+          { partition: row.value.partition, id: row.value.id },
+          row.version,
+        );
+      }
+    }
+    now = "2026-07-28T12:02:00.000Z" as IsoTimestamp;
+    failing.arm();
+    await identity.sweepEmailOperations();
+    await expect(
+      operations.get({ partition: firstPartition, id: firstHash }),
+    ).resolves.not.toBeNull();
+    const ownerHash = await principalHash(principalId);
+    await expect(
+      store.collection(usersCollection).get({
+        partition: `principal-${ownerHash.slice(0, 16)}`,
+        id: ownerHash,
+      }),
+    ).resolves.toMatchObject({
+      email: `superseded-c-${suffix}@example.test`,
+      emailChangeOperationHash: secondHash,
+    });
+
+    await identity.sweepEmailOperations();
+    await expect(
+      store.collection(usersCollection).get({
+        partition: `principal-${ownerHash.slice(0, 16)}`,
+        id: ownerHash,
+      }),
+    ).resolves.toMatchObject({ emailChangeOperationHash: null });
+    await identity.sweepEmailOperations();
+    await expect(
+      operations.get({ partition: firstPartition, id: firstHash }),
+    ).resolves.toBeNull();
+
+    const later = await identity.beginEmailChange(
+      principalId,
+      `superseded-d-${suffix}@example.test`,
+      "later",
+    );
+    await expect(
+      identity.finishEmailChange({
+        principalId,
+        codeHandle: later.codeHandle,
+        code: await codeFor(protector, later.codeHandle),
+        rateLimitKey: "later",
+      }),
+    ).resolves.toMatchObject({
+      email: `superseded-d-${suffix}@example.test`,
+    });
+  });
 });
 import { randomUUID } from "node:crypto";
 
