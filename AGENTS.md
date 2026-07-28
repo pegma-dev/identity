@@ -66,12 +66,12 @@ precedent for the storage posture here.
 
 ## Where things stand
 
-The audited `0.0.0` package is published under the `bootstrap` tag solely to
-reserve `@pegma/identity`. Version `0.1.0` is the first advertised stable
-release candidate. Its runtime and API were fixed by the reviewed
-user/email-index, durable email-code, Mail, and passkey implementation; release
-preparation may change only version metadata, status documentation, and release
-notes.
+The audited `0.0.0` package remains under the `bootstrap` tag solely to reserve
+`@pegma/identity`. Version `0.1.0` is the first advertised supported release,
+published from its protected signed tag through trusted-publisher OIDC. Its
+runtime and API contain the reviewed user/email-index, durable email-code,
+Mail, and passkey implementation. pegma.dev composes it in production with
+Sessions, Rate Limit, and `@pegma/authorization-identity@0.1.2`.
 
 Normal releases use the protected signed annotated `vX.Y.Z` tag and GitHub
 release workflow described in `docs/RELEASING.md`. Never publish a locally

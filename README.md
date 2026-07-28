@@ -7,11 +7,11 @@ email-code fallback, **no passwords** — user records in your own storage, no
 external provider.
 
 > [!IMPORTANT]
-> Identity's audited `0.0.0` name-reservation bootstrap is published. This
-> repository now prepares `0.1.0`, the first advertised stable release, with
-> durable email-code creation, fallback, recovery, email change, and passkeys.
-> The release is not published until the reviewed PR is merged and the signed
-> `v0.1.0` GitHub release ceremony completes.
+> `@pegma/identity@0.1.0` is the first advertised supported release, published
+> from the protected signed `v0.1.0` tag through trusted-publisher OIDC. Its
+> public API remains unstable. pegma.dev composes it in production with
+> Sessions, Mail, durable Rate Limit policies, and
+> `@pegma/authorization-identity@0.1.2`.
 
 ## What it is — and refuses to be
 
