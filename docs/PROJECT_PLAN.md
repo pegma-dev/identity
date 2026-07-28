@@ -2,16 +2,19 @@
 
 ## Status
 
-**Stage:** first advertised stable release candidate (`0.1.0`).
+**Stage:** first advertised stable release (`0.1.0`), published.
 The audited `0.0.0` name-reservation bootstrap is published and deliberately
 unadvertised. Version `0.1.0` contains the reviewed full passwordless
-lifecycle; it remains unpublished until the protected release ceremony.
+lifecycle. It was published from the protected, signed annotated `v0.1.0` tag
+through the hardened GitHub Actions workflow using npm trusted publishing.
 The user/email-index model, durable email-code creation/fallback/recovery and
 email-change lifecycle, and passkey/challenge foundation are built and tested
 over memory plus real Azurite races. Mail delivery uses exact
 `@pegma/mail@0.1.0`; Identity owns the operation/Mail union required to commit
 code state and delivery intent atomically. The threat model and hardened
-release scaffold gate every identity change.
+release scaffold gate every identity change. The first-party pegma.dev host
+now composes `@pegma/identity@0.1.0` with
+`@pegma/authorization-identity@0.1.2`.
 
 **License:** MIT
 
@@ -26,8 +29,8 @@ here; nothing was ever published under another name.
 **Storage:** collections over an injected `@pegma/storage-core` `Store`;
 time, logging, and `PrincipalId` from `@pegma/spine`. Pinned exactly. No
 dependency on authorization-core — the link into it is a separate,
-deliberately tiny adapter (`@pegma/authorization-identity`, planned in that
-repository).
+deliberately tiny published adapter
+(`@pegma/authorization-identity@0.1.2`).
 
 ## Vision
 
@@ -204,22 +207,24 @@ Registration and authentication ceremonies, credential management,
 counter handling. Exit: a host can run passkey-only sign-in with email
 strictly as enrollment/recovery.
 
-### Phase 4 — threat model, review, first consumer (release gate implemented)
+### Phase 4 — threat model, review, first consumer (released)
 
 THREAT_MODEL.md and repeated adversarial review passes gate the release. The
 audited `0.0.0` package-name bootstrap followed the ecosystem bootstrap rule
-(npm/cli#8544). The first advertised `0.1.0` release is prepared from the
-reviewed implementation without runtime or API changes. A real consumer wired
-end-to-end remains follow-up integration work rather than a reason to weaken
-the package boundary.
+(npm/cli#8544). The first advertised `0.1.0` release was published from its
+protected, signed annotated tag through the GitHub Actions workflow using npm
+trusted publishing, without runtime or API changes. pegma.dev now composes the
+package and the published Authorization adapter; consumer deployment remains
+independent of the package boundary.
 
 ## Timing
 
 The storage, rate-limit, WebAuthn, and Mail prerequisites exist. Phases 1, 2,
 and 3 are implemented, the threat model and adversarial release review are
-complete, and the audited `0.0.0` bootstrap is published. The remaining step
-for the first advertised release is the protected `v0.1.0` release ceremony.
-First-consumer integration follows independently.
+complete, and both the audited `0.0.0` bootstrap and advertised `0.1.0`
+release are published. The protected `v0.1.0` release ceremony is complete,
+and pegma.dev composes Identity with
+`@pegma/authorization-identity@0.1.2`.
 
 ## Open questions
 
