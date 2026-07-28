@@ -21,7 +21,7 @@ const NODE_RANGE = ">=22";
 const REQUIRED_DEPENDENCIES = {
   "@pegma/rate-limit": "0.1.0",
   "@pegma/spine": "0.1.1",
-  "@pegma/storage-core": "0.3.0",
+  "@pegma/storage-core": "0.4.0",
   "@simplewebauthn/server": "13.3.2",
   tr46: "6.0.0",
   "unicode-case-folding": "1.1.1",

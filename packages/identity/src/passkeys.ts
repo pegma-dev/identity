@@ -18,14 +18,17 @@ import {
   bytesToBase64Url,
   credentialHash,
   principalHash,
+  registrationProofHash,
 } from "./crypto.js";
 import { IdentityError } from "./errors.js";
 import {
   credentialIndexesCollection,
   passkeysCollection,
+  registrationProofsCollection,
   TRANSPORTS,
   type CredentialIndexRecord,
   type PasskeyRecord,
+  type RegistrationProofRecord,
 } from "./records.js";
 import type { User, UserService, VerifiedIdentityClaims } from "./users.js";
 import {
@@ -115,6 +118,10 @@ function credentialKey(hash: string) {
   return { partition: `credential-${hash.slice(0, 16)}`, id: hash };
 }
 
+function registrationProofKey(hash: string) {
+  return { partition: `registration-${hash.slice(0, 16)}`, id: hash };
+}
+
 function publicPasskey(record: PasskeyRecord): Passkey {
   return Object.freeze({
     credentialId: record.credentialId,
@@ -164,6 +171,7 @@ function sameRegistration(
     current.credentialHash === proposed.credentialHash &&
     current.credentialId === proposed.credentialId &&
     current.registrationId === proposed.registrationId &&
+    current.registrationProofHash === proposed.registrationProofHash &&
     current.principalId === proposed.principalId &&
     current.principalHash === proposed.principalHash &&
     current.publicKey === proposed.publicKey &&
@@ -174,6 +182,50 @@ function sameRegistration(
     current.transports.length === proposed.transports.length &&
     current.transports.every(
       (transport, index) => transport === proposed.transports[index],
+    )
+  );
+}
+
+type RegistrationMaterial = Omit<
+  CredentialIndexRecord,
+  "partition" | "id" | "registrationProofHash" | "state"
+>;
+
+function registrationProofMaterial(material: RegistrationMaterial): string {
+  return JSON.stringify([
+    material.credentialHash,
+    material.credentialId,
+    material.registrationId,
+    material.principalId,
+    material.principalHash,
+    material.publicKey,
+    material.counter,
+    [...material.transports],
+    material.label,
+    material.createdAt,
+    material.updatedAt,
+  ]);
+}
+
+function sameRegistrationProof(
+  proof: RegistrationProofRecord,
+  index: CredentialIndexRecord,
+): boolean {
+  return (
+    proof.registrationProofHash === index.registrationProofHash &&
+    proof.credentialHash === index.credentialHash &&
+    proof.credentialId === index.credentialId &&
+    proof.registrationId === index.registrationId &&
+    proof.principalId === index.principalId &&
+    proof.principalHash === index.principalHash &&
+    proof.publicKey === index.publicKey &&
+    proof.counter === index.counter &&
+    proof.label === index.label &&
+    proof.createdAt === index.createdAt &&
+    proof.updatedAt === index.updatedAt &&
+    proof.transports.length === index.transports.length &&
+    proof.transports.every(
+      (transport, position) => transport === index.transports[position],
     )
   );
 }
@@ -254,6 +306,61 @@ export function createPasskeyService(
 ): PasskeyService {
   const passkeys = options.store.collection(passkeysCollection);
   const credentials = options.store.collection(credentialIndexesCollection);
+  const registrationProofs = options.store.collection(
+    registrationProofsCollection,
+  );
+
+  async function assertRegistrationProof(
+    index: CredentialIndexRecord,
+  ): Promise<void> {
+    const proof = await registrationProofs.get(
+      registrationProofKey(index.registrationProofHash),
+    );
+    if (proof === null || !sameRegistrationProof(proof, index)) {
+      throw new IdentityError(
+        "storage_corrupt",
+        "Stored credential registration proof is malformed.",
+      );
+    }
+    const expectedHash = await registrationProofHash(
+      registrationProofMaterial(proof),
+    );
+    if (expectedHash !== proof.registrationProofHash) {
+      throw new IdentityError(
+        "storage_corrupt",
+        "Stored credential registration proof is malformed.",
+      );
+    }
+  }
+
+  async function persistRegistrationProof(
+    material: RegistrationMaterial,
+  ): Promise<string> {
+    const proofHash = await registrationProofHash(
+      registrationProofMaterial(material),
+    );
+    const proposed: RegistrationProofRecord = {
+      ...registrationProofKey(proofHash),
+      ...material,
+      registrationProofHash: proofHash,
+    };
+    const inserted = await registrationProofs.insertIfAbsent(proposed);
+    if (
+      inserted.value.registrationProofHash !== proofHash ||
+      !sameRegistrationProof(inserted.value, {
+        ...credentialKey(material.credentialHash),
+        ...material,
+        registrationProofHash: proofHash,
+        state: "reserved",
+      })
+    ) {
+      throw new IdentityError(
+        "storage_corrupt",
+        "Stored credential registration proof is malformed.",
+      );
+    }
+    return proofHash;
+  }
 
   async function assertCredentialMirror(
     index: CredentialIndexRecord,
@@ -357,10 +464,7 @@ export function createPasskeyService(
         }
         if (
           current === null ||
-          current.principalId !== index.principalId ||
-          current.principalHash !== index.principalHash ||
-          current.credentialId !== index.credentialId ||
-          current.registrationId !== index.registrationId ||
+          !sameRegistration(current, index) ||
           current.state !== "reserved"
         ) {
           return { action: "keep" };
@@ -375,9 +479,7 @@ export function createPasskeyService(
     if (
       result.value === null ||
       result.value.state !== "active" ||
-      result.value.principalId !== index.principalId ||
-      result.value.principalHash !== index.principalHash ||
-      result.value.registrationId !== index.registrationId
+      !sameRegistration(result.value, index)
     ) {
       throw new IdentityError(
         "conflict",
@@ -389,7 +491,6 @@ export function createPasskeyService(
 
   async function repair(
     index: CredentialIndexRecord,
-    allowMissingMirror = false,
   ): Promise<PasskeyRecord | null> {
     await assertCredentialOwner(index);
     if (index.state === "revoked") {
@@ -420,22 +521,20 @@ export function createPasskeyService(
       }
       return null;
     }
-    if (!allowMissingMirror) {
-      const current = await credentials.get(
-        credentialKey(index.credentialHash),
+    const current = await credentials.get(credentialKey(index.credentialHash));
+    if (
+      current === null ||
+      current.state !== index.state ||
+      !sameRegistration(current, index)
+    ) {
+      throw new IdentityError(
+        "conflict",
+        "Credential changed while it was being repaired.",
       );
-      if (
-        current === null ||
-        current.state !== index.state ||
-        current.registrationId !== index.registrationId ||
-        current.principalId !== index.principalId ||
-        current.principalHash !== index.principalHash
-      ) {
-        throw new IdentityError(
-          "conflict",
-          "Credential changed while it was being repaired.",
-        );
-      }
+    }
+    if (index.state === "reserved") {
+      await assertRegistrationProof(index);
+    } else {
       await assertCredentialMirror(index);
     }
     const passkey = await ensurePasskey(index);
@@ -444,12 +543,25 @@ export function createPasskeyService(
   }
 
   async function persistCredential(
-    material: Omit<CredentialIndexRecord, "partition" | "id" | "state">,
+    material: RegistrationMaterial,
   ): Promise<PasskeyRecord> {
     const key = credentialKey(material.credentialHash);
+    const existing = await credentials.get(key);
+    if (existing !== null && existing.state !== "revoked") {
+      await assertCredentialOwner(existing);
+      if (existing.state === "reserved") {
+        await repair(existing);
+      }
+      throw new IdentityError(
+        "conflict",
+        "Credential is already bound to another registration.",
+      );
+    }
+    const proofHash = await persistRegistrationProof(material);
     const proposed: CredentialIndexRecord = {
       ...key,
       ...material,
+      registrationProofHash: proofHash,
       state: "reserved",
     };
     let index = (await credentials.insertIfAbsent(proposed)).value;
@@ -496,7 +608,7 @@ export function createPasskeyService(
         "Another credential registration won the race.",
       );
     }
-    const repaired = await repair(index, true);
+    const repaired = await repair(index);
     if (repaired === null) {
       throw new IdentityError(
         "invalid_state",

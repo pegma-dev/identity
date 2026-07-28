@@ -77,19 +77,18 @@ Security invariants:
   scoped to configured RP IDs and origins, and support multiple credentials
   per principal. Every credential-index trust boundary recomputes
   `principalHash` from `principalId` before verification, mutation, repair, or
-  claims issuance and cross-checks the independently stored active passkey
-  mirror's owner, credential identity, generation, public key, transports,
-  label, creation time, and counter.
+  claims issuance. A reserved generation can create its passkey mirror only
+  from an exact, content-addressed immutable registration proof stored before
+  the reservation; an active generation must cross-check the independently
+  stored passkey mirror's owner, credential identity, generation, public key,
+  transports, label, creation time, and counter.
 - Challenges are unpredictable, hashed at rest, short-lived, single-use,
-  attempt-bounded, and version-conditionally swept through a caller-supplied
-  durable lazy retention index. A sweep pulls and inspects at most its limit;
-  it never enumerates the authoritative challenge collection. Each candidate
-  carries a trusted host-issued cursor and immutable retention-id/handle
-  locator from record metadata separately from its untrusted payload, so
-  malformed payloads can be advanced and valid pointers can be repaired from
-  authoritative rows without orphaning them. Candidate enumeration durably
-  advances a fair scan position independently of expiry metadata, so early or
-  late corruption and live prefixes cannot starve expired work.
+  attempt-bounded, and version-conditionally swept through storage-core's
+  authoritative bounded collection scan. The adapter returns at most the
+  requested limit, the physical key and version of every row, and an opaque
+  continuation that survives process restart. A null continuation closes the
+  cycle, so live rows do not cause a hot retry loop; repeated complete cycles
+  cannot permanently starve committed work.
 - A positive nonzero signature counter must strictly increase. A counter may
   remain zero only when both stored and newly reported values are zero.
 - Raw token-shaped values, future one-time codes, and challenge verification
@@ -119,22 +118,15 @@ Cross-collection crashes are expected, so intermediate states are durable and
 repairable rather than treated as exceptional.
 
 WebAuthn option generation can be abused for storage exhaustion. Challenge
-TTLs, maximum attempts, bounded identifiers and labels, a required durable
-retention index, truly bounded lazy candidate pulls, and host endpoint rate
-limiting constrain the budget. The harmless retention reference is written
-before its authoritative challenge, so crashes can create stale references
-but not unsweepable rows. Retention adapters idempotently upsert by retention
-identity, return one stable unique cursor, and derive candidate cursors from
-record metadata together with an immutable retention-id/handle locator rather
-than trusting corruptible payload fields. Candidate enumeration durably
-advances a fair scan cursor independently of separately stored expiry
-metadata, preventing early or late expiry corruption and continuously
-refilled live prefixes from hiding expired work. Sweep uses the locator to
-recover the authoritative challenge and re-tracks every surfaced row,
-including non-removable live rows, before advancing. This repairs payload and
-expiry metadata; repair failure retains the pointer. An entry is discarded
-only when the trusted locator has no row. One poisoned front entry therefore
-cannot starve the bounded scan or orphan a reachable challenge.
+TTLs, maximum attempts, bounded identifiers and labels, authoritative
+adapter-bounded scan pages, and host endpoint rate limiting constrain the
+budget. Sweep decodes each physical row independently, so a malformed row is
+retained for investigation without preventing the continuation from reaching
+later rows. It deletes only by the adapter-issued physical key and version.
+Opaque continuations may be replayed after a crash or by concurrent sweepers;
+conditional deletion makes duplicate pages harmless. A null continuation
+ends the current cycle even when rows remain live, preventing immediate
+retry loops while the next scheduled cycle restores eventual visibility.
 Authentication uses discoverable credentials and does not accept an email
 identity hint.
 Verification pins the expected RP ID, allowed origin, challenge digest, and
@@ -155,20 +147,15 @@ state.
 
 Storage poisoning can target codecs, sweep key reconstruction, or state
 machines. Codecs validate types, exact enum values, timestamp shape, hashes,
-and identity relationships. Credential index reads recompute the owner digest
-and require an exact independently stored passkey binding before any challenge
-claim, signature verification, repair, mutation, or claims lookup. The binding
-is repeated inside counter/revocation mutations and immediately before claims
-issuance, so substituting both owner fields cannot attach an attacker's
-credential material to a victim. Sweeps delete only keys reconstructed from
-valid authoritative records and pair each with the version returned for that
-record.
-Retention payloads never provide lookup or removal authority: their separate
-trusted cursor and immutable locator advance missing rows, while every
-existing challenge is repaired before its old cursor can be settled, and the
-stable cursor for an authoritative reference is reconfirmed before deletion.
-Unknown authoritative states are retained for investigation and never
-promoted.
+and identity relationships. Email-index repair recomputes `principalHash` from
+`principalId` before any write. Reserved credential repair requires the exact
+immutable registration proof; active credential reads require an exact
+independently stored passkey binding before any challenge claim, signature
+verification, repair, mutation, or claims lookup. These checks prevent
+substituting both owner fields from attaching an attacker's credential
+material to a victim. Sweeps delete only adapter-issued physical keys paired
+with the version returned for that row. Malformed and unknown authoritative
+states are retained for investigation and never promoted.
 
 Object-shape attacks can hide work in getters or prototypes. Public structured
 inputs are copied from property descriptors only after rejecting accessors,

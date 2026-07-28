@@ -2,7 +2,7 @@ import { fixedClock } from "@pegma/spine";
 import { createMemoryStore } from "@pegma/storage-core";
 import { describe, expect, it } from "vitest";
 
-import { createIdentity, createMemoryChallengeRetention } from "./index.js";
+import { createIdentity } from "./index.js";
 
 const allow = {
   async allow() {
@@ -19,7 +19,6 @@ function identity() {
     origins: ["https://example.test"],
     registrationLimiter: allow,
     authenticationLimiter: allow,
-    challengeRetention: createMemoryChallengeRetention(),
     clock: fixedClock("2026-07-27T12:00:00.000Z"),
   });
 }

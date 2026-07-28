@@ -33,10 +33,7 @@ OIDC/OAuth2, connect social providers, or implement passwords.
 ## Construction
 
 ```ts
-import {
-  createIdentity,
-  createMemoryChallengeRetention,
-} from "@pegma/identity";
+import { createIdentity } from "@pegma/identity";
 import { createDurableLimiter } from "@pegma/rate-limit";
 import { createMemoryStore } from "@pegma/storage-core";
 
@@ -58,8 +55,6 @@ const identity = createIdentity({
   origins: ["https://example.com"],
   registrationLimiter,
   authenticationLimiter,
-  // Development only. Production hosts provide a durable lazy index.
-  challengeRetention: createMemoryChallengeRetention(),
 });
 ```
 
@@ -67,20 +62,9 @@ Use a durable limiter in production. The caller-provided `rateLimitKey`
 should identify an abuse scope such as a source address; it is not an email or
 credential secret.
 
-Production hosts must also provide a durable `ChallengeRetention`. Identity
-tracks a harmless hash/expiry reference before inserting each authoritative
-challenge, so a crash can leave only a stale reference, never an unsweepable
-challenge. `track(reference)` must idempotently upsert the reference and return
-one stable, unique opaque cursor for its `retentionId`. The host adapter's
-`candidates(limit)` must durably advance a fair scan cursor before yielding,
-independently of any expiry-order field. New entries must not reset or jump
-that cursor. It must derive the returned cursor and an immutable
-`{ retentionId, handleHash }` locator from trusted retention-record metadata
-and return both separately from the untrusted stored `reference` payload. It
-must be lazy and must not materialize more than `limit` candidates.
-`complete(cursor)` removes by trusted cursor even when the payload is
-malformed. The included memory implementation is for tests and non-durable
-development only.
+Challenge retention uses storage-core's authoritative bounded scan directly;
+there is no host-maintained secondary index. This requires
+`@pegma/storage-core@0.4.0` or a conforming adapter at that contract version.
 
 ## Verified provisioning
 
@@ -140,20 +124,27 @@ The host must authenticate passkey list/add/remove endpoints for the named
 principal. Removing the last passkey is allowed; the documented email
 recovery floor will become available only with the mail phase.
 
-Run `sweepChallenges(limit)` periodically. It pulls and authoritatively
-inspects at most `limit` lazy retention candidates, never scans the challenge
-collection, key-checks each reference, and deletes expired records with
-version-conditional deletion. A durable fair scan position makes every entry
-visible independently of early or late corruption in separately stored expiry
-metadata, so a stable or continuously refilled live prefix cannot starve
-expired work. Every surfaced authoritative row is re-tracked before the sweep
-advances, including live rows; this repairs payload and expiry metadata, while
-repair failure retains the pointer. A malformed payload is discarded only
-when its trusted locator has no authoritative row. Stale, duplicate,
-malformed, and wrong payloads cannot supply a delete key for another row or
-orphan the only valid pointer. The returned `hasMore` is conservative:
-`true` means call again now; `false` means the fair source ended during this
-pass.
+Run `sweepChallenges(limit, cursor)` periodically. Each call scans and
+inspects at most `limit` physical challenge rows, retains malformed rows for
+investigation, and deletes expired or terminal rows by their adapter-issued
+physical key and version:
+
+```ts
+let cursor: string | undefined;
+do {
+  const result = await identity.sweepChallenges(100, cursor);
+  cursor = result.cursor ?? undefined;
+  if (!result.hasMore) break;
+} while (true);
+```
+
+An omitted cursor starts a cycle; `cursor: null` and `hasMore: false` mark its
+end. Live rows do not request an immediate retry once that boundary is
+reached—start a new cycle on the next scheduled maintenance run. Persisting a
+non-null cursor between calls avoids restarting a long cycle. Replaying a
+cursor after a crash or from concurrent sweepers is safe: pages may repeat,
+but deletion is version-conditional and a changed or already removed row is
+left for a later cycle.
 
 ## Security posture
 

@@ -1,5 +1,10 @@
-import type { Clock, IsoTimestamp, PrincipalId } from "@pegma/spine";
-import type { CollectionStore, Store } from "@pegma/storage-core";
+import type { Clock, PrincipalId } from "@pegma/spine";
+import {
+  defineCollection,
+  type CollectionStore,
+  type Store,
+  type StoredRecord,
+} from "@pegma/storage-core";
 
 import {
   challengeHandleHash,
@@ -16,11 +21,7 @@ import {
 import {
   addMilliseconds,
   assertBoundedString,
-  assertCanonicalTimestamp,
-  assertHash,
   assertPrincipalId,
-  copyDataOnly,
-  dataField,
   timestampFromClock,
 } from "./validation.js";
 
@@ -30,127 +31,6 @@ interface ChallengeServiceOptions {
   readonly newId: () => string;
   readonly ttlMs: number;
   readonly maxAttempts: number;
-  readonly retention: ChallengeRetention;
-}
-
-export interface ChallengeRetentionReference {
-  readonly retentionId: string;
-  readonly handleHash: string;
-  readonly expiresAt: IsoTimestamp;
-}
-
-export interface ChallengeRetentionLocator {
-  readonly retentionId: string;
-  readonly handleHash: string;
-}
-
-export type ChallengeRetentionCursor = string;
-
-export interface ChallengeRetentionCandidate {
-  /**
-   * Opaque, trusted key constructed by the host adapter from retention-record
-   * metadata, never from the possibly corrupt reference payload.
-   */
-  readonly cursor: ChallengeRetentionCursor;
-  /**
-   * Immutable identity constructed from retention-record metadata, never from
-   * the possibly corrupt reference payload.
-   */
-  readonly locator: ChallengeRetentionLocator;
-  /** Untrusted stored payload; Identity validates it without invoking getters. */
-  readonly reference: unknown;
-}
-
-/**
- * A durable, lazily-read retention index supplied by the host.
- *
- * `track()` is an idempotent upsert and returns the same stable, unique cursor
- * for every reference with the same retention id.
- * `candidates(limit)` must durably advance a fair scan position before
- * yielding. Every retained entry must become visible independent of its
- * expiry-order metadata, and newly tracked entries must not reset or jump the
- * scan position. This makes both early and late corruption of an expiry index
- * self-healing when Identity re-tracks the authoritative reference. Each
- * cursor and immutable locator comes from trusted record metadata, remains
- * separate from the untrusted stored reference payload, and the adapter must
- * not pre-materialize more than `limit` candidates. Identity calls `next()`
- * at most `limit` times and never enumerates the challenge collection.
- * `complete()` removes the entry named by the opaque cursor even when its
- * payload is malformed.
- */
-export interface ChallengeRetention {
-  track(
-    reference: ChallengeRetentionReference,
-  ): Promise<ChallengeRetentionCursor>;
-  candidates(limit: number): AsyncIterable<ChallengeRetentionCandidate>;
-  complete(cursor: ChallengeRetentionCursor): Promise<void>;
-}
-
-/** In-memory retention index for tests and non-durable development hosts. */
-export function createMemoryChallengeRetention(): ChallengeRetention {
-  const references = new Map<
-    string,
-    {
-      readonly locator: ChallengeRetentionLocator;
-      readonly reference: ChallengeRetentionReference;
-      readonly expiresAt: IsoTimestamp;
-    }
-  >();
-  let nextCursor: string | null = null;
-  return {
-    async track(reference) {
-      references.set(
-        reference.retentionId,
-        Object.freeze({
-          locator: Object.freeze({
-            retentionId: reference.retentionId,
-            handleHash: reference.handleHash,
-          }),
-          reference: Object.freeze({ ...reference }),
-          expiresAt: reference.expiresAt,
-        }),
-      );
-      return reference.retentionId;
-    },
-    async *candidates(limit) {
-      const cursors = [...references.keys()];
-      if (cursors.length === 0) {
-        return;
-      }
-      let position =
-        nextCursor === null ? 0 : Math.max(0, cursors.indexOf(nextCursor));
-      let yielded = 0;
-      while (yielded < limit && yielded < cursors.length) {
-        const cursor = cursors[position];
-        if (cursor === undefined) {
-          break;
-        }
-        position = (position + 1) % cursors.length;
-        nextCursor = cursors[position] ?? null;
-        const entry = references.get(cursor);
-        if (entry === undefined) {
-          continue;
-        }
-        yielded += 1;
-        yield Object.freeze({
-          cursor,
-          locator: entry.locator,
-          reference: entry.reference,
-        });
-      }
-    },
-    async complete(cursor) {
-      if (nextCursor === cursor) {
-        const cursors = [...references.keys()];
-        const position = cursors.indexOf(cursor);
-        nextCursor =
-          position === -1 || cursors.length <= 1
-            ? null
-            : (cursors[(position + 1) % cursors.length] ?? null);
-      }
-      references.delete(cursor);
-    },
-  };
 }
 
 export interface ClaimedChallenge {
@@ -172,16 +52,27 @@ export interface ChallengeService {
   releaseFailedClaim(claim: ClaimedChallenge): Promise<void>;
   consumeClaim(claim: ClaimedChallenge): Promise<void>;
   matches(record: ChallengeRecord, candidate: string): Promise<boolean>;
-  sweep(limit?: number): Promise<ChallengeSweepResult>;
+  sweep(limit?: number, cursor?: string): Promise<ChallengeSweepResult>;
 }
 
 export interface ChallengeSweepResult {
   readonly pulled: number;
   readonly inspected: number;
   readonly deleted: number;
-  readonly completed: number;
   readonly rejected: number;
+  readonly cursor: string | null;
   readonly hasMore: boolean;
+}
+
+interface SafeScanRecord {
+  readonly key: { readonly partition: string; readonly id: string };
+  readonly value: StoredRecord;
+  readonly version: string;
+}
+
+interface SafeScanPage {
+  readonly records: readonly SafeScanRecord[];
+  readonly nextCursor: string | null;
 }
 
 function challengeKey(hash: string) {
@@ -202,149 +93,163 @@ function belongsTo(
   );
 }
 
-function retentionReference(
-  value: unknown,
-): ChallengeRetentionReference | null {
-  try {
-    const safe = copyDataOnly(value);
-    const retentionId = assertHash(
-      assertBoundedString(
-        dataField(safe, "retentionId"),
-        "Retention identifier",
-        64,
-      ),
-      "Retention identifier",
-    );
-    const handleHash = assertHash(
-      assertBoundedString(
-        dataField(safe, "handleHash"),
-        "Retention handle hash",
-        64,
-      ),
-      "Retention handle hash",
-    );
-    const expiresAt = assertCanonicalTimestamp(
-      dataField(safe, "expiresAt"),
-      "Retention expiry",
-    );
-    return Object.freeze({ retentionId, handleHash, expiresAt });
-  } catch {
-    return null;
-  }
-}
+const challengeScanCollection = defineCollection<StoredRecord>({
+  name: challengesCollection.name,
+  key: (record) =>
+    challengesCollection.key(challengesCollection.codec.decode(record)),
+  codec: {
+    encode: (record) => record,
+    decode: (record) => record,
+  },
+});
 
-function retentionCursor(value: unknown): ChallengeRetentionCursor {
-  try {
-    return assertBoundedString(value, "Retention cursor", 1_024);
-  } catch (cause) {
-    throw new IdentityError(
-      "invalid_state",
-      "Challenge retention returned an invalid cursor.",
-      { cause },
-    );
-  }
-}
-
-function retentionLocator(value: unknown): ChallengeRetentionLocator {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new IdentityError(
-      "invalid_state",
-      "Challenge retention returned an invalid locator.",
-    );
-  }
-  const prototype = Object.getPrototypeOf(value);
-  const descriptors = Object.getOwnPropertyDescriptors(value);
-  const keys = Reflect.ownKeys(descriptors);
-  const retentionId = descriptors.retentionId;
-  const handleHash = descriptors.handleHash;
+function ownData(value: object, name: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, name);
   if (
-    (prototype !== Object.prototype && prototype !== null) ||
-    keys.length !== 2 ||
-    keys.some(
-      (key) =>
-        typeof key === "symbol" ||
-        (key !== "retentionId" && key !== "handleHash"),
-    ) ||
-    retentionId === undefined ||
-    !retentionId.enumerable ||
-    !("value" in retentionId) ||
-    handleHash === undefined ||
-    !handleHash.enumerable ||
-    !("value" in handleHash)
+    descriptor === undefined ||
+    !descriptor.enumerable ||
+    !("value" in descriptor)
   ) {
     throw new IdentityError(
       "invalid_state",
-      "Challenge retention returned an invalid locator.",
+      "Challenge scan returned malformed data.",
     );
   }
-  try {
-    return Object.freeze({
-      retentionId: assertHash(
-        assertBoundedString(
-          retentionId.value,
-          "Retention locator identifier",
-          64,
-        ),
-        "Retention locator identifier",
-      ),
-      handleHash: assertHash(
-        assertBoundedString(
-          handleHash.value,
-          "Retention locator handle hash",
-          64,
-        ),
-        "Retention locator handle hash",
-      ),
-    });
-  } catch (cause) {
-    throw new IdentityError(
-      "invalid_state",
-      "Challenge retention returned an invalid locator.",
-      { cause },
-    );
-  }
+  return descriptor.value;
 }
 
-function retentionCandidate(value: unknown): ChallengeRetentionCandidate {
+function scanRecord(value: unknown): SafeScanRecord {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new IdentityError(
       "invalid_state",
-      "Challenge retention returned an invalid candidate.",
+      "Challenge scan returned malformed data.",
     );
   }
   const prototype = Object.getPrototypeOf(value);
-  const descriptors = Object.getOwnPropertyDescriptors(value);
-  const keys = Reflect.ownKeys(descriptors);
-  const cursor = descriptors.cursor;
-  const locator = descriptors.locator;
-  const reference = descriptors.reference;
+  const keys = Reflect.ownKeys(Object.getOwnPropertyDescriptors(value));
   if (
     (prototype !== Object.prototype && prototype !== null) ||
     keys.length !== 3 ||
     keys.some(
       (key) =>
         typeof key === "symbol" ||
-        (key !== "cursor" && key !== "locator" && key !== "reference"),
-    ) ||
-    cursor === undefined ||
-    !cursor.enumerable ||
-    !("value" in cursor) ||
-    locator === undefined ||
-    !locator.enumerable ||
-    !("value" in locator) ||
-    reference === undefined ||
-    !reference.enumerable ||
-    !("value" in reference)
+        (key !== "key" && key !== "value" && key !== "version"),
+    )
   ) {
     throw new IdentityError(
       "invalid_state",
-      "Challenge retention returned an invalid candidate.",
+      "Challenge scan returned malformed data.",
+    );
+  }
+  const key = ownData(value, "key");
+  const record = ownData(value, "value");
+  const version = ownData(value, "version");
+  if (
+    typeof key !== "object" ||
+    key === null ||
+    Array.isArray(key) ||
+    (Object.getPrototypeOf(key) !== Object.prototype &&
+      Object.getPrototypeOf(key) !== null) ||
+    Reflect.ownKeys(Object.getOwnPropertyDescriptors(key)).length !== 2 ||
+    typeof record !== "object" ||
+    record === null ||
+    Array.isArray(record) ||
+    typeof version !== "string" ||
+    version.length === 0 ||
+    version.length > 16_384
+  ) {
+    throw new IdentityError(
+      "invalid_state",
+      "Challenge scan returned malformed data.",
+    );
+  }
+  const partition = ownData(key, "partition");
+  const id = ownData(key, "id");
+  if (
+    typeof partition !== "string" ||
+    partition.length === 0 ||
+    partition.length > 1_024 ||
+    typeof id !== "string" ||
+    id.length === 0 ||
+    id.length > 1_024
+  ) {
+    throw new IdentityError(
+      "invalid_state",
+      "Challenge scan returned malformed data.",
     );
   }
   return Object.freeze({
-    cursor: retentionCursor(cursor.value),
-    locator: retentionLocator(locator.value),
-    reference: reference.value,
+    key: Object.freeze({ partition, id }),
+    value: record as StoredRecord,
+    version,
+  });
+}
+
+function scanPage(value: unknown, limit: number): SafeScanPage {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new IdentityError(
+      "invalid_state",
+      "Challenge scan returned malformed data.",
+    );
+  }
+  const prototype = Object.getPrototypeOf(value);
+  const keys = Reflect.ownKeys(Object.getOwnPropertyDescriptors(value));
+  if (
+    (prototype !== Object.prototype && prototype !== null) ||
+    keys.length !== 2 ||
+    keys.some(
+      (key) =>
+        typeof key === "symbol" || (key !== "records" && key !== "nextCursor"),
+    )
+  ) {
+    throw new IdentityError(
+      "invalid_state",
+      "Challenge scan returned malformed data.",
+    );
+  }
+  const records = ownData(value, "records");
+  const nextCursor = ownData(value, "nextCursor");
+  if (
+    !Array.isArray(records) ||
+    records.length > limit ||
+    (nextCursor !== null &&
+      (typeof nextCursor !== "string" ||
+        nextCursor.length === 0 ||
+        nextCursor.length > 16_384))
+  ) {
+    throw new IdentityError(
+      "invalid_state",
+      "Challenge scan returned malformed data.",
+    );
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(records);
+  const safeRecords: SafeScanRecord[] = [];
+  for (let index = 0; index < records.length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (
+      descriptor === undefined ||
+      !descriptor.enumerable ||
+      !("value" in descriptor)
+    ) {
+      throw new IdentityError(
+        "invalid_state",
+        "Challenge scan returned malformed data.",
+      );
+    }
+    safeRecords.push(scanRecord(descriptor.value));
+  }
+  if (
+    Reflect.ownKeys(descriptors).filter((key) => key !== "length").length !==
+    records.length
+  ) {
+    throw new IdentityError(
+      "invalid_state",
+      "Challenge scan returned malformed data.",
+    );
+  }
+  return Object.freeze({
+    records: Object.freeze(safeRecords),
+    nextCursor,
   });
 }
 
@@ -353,6 +258,7 @@ export function createChallengeService(
 ): ChallengeService {
   const collection: CollectionStore<ChallengeRecord> =
     options.store.collection(challengesCollection);
+  const scanCollection = options.store.collection(challengeScanCollection);
 
   return {
     async storeChallenge(kind, challengeInput, principalInput) {
@@ -386,17 +292,9 @@ export function createChallengeService(
           256,
         );
         const handleHash = await challengeHandleHash(handle);
-        const retentionId = await challengeHandleHash(
-          `retention:${assertBoundedString(
-            options.newId(),
-            "Generated retention identifier",
-            256,
-          )}`,
-        );
         const record: ChallengeRecord = {
           ...challengeKey(handleHash),
           handleHash,
-          retentionId,
           challengeHash,
           kind,
           state: "pending",
@@ -409,33 +307,9 @@ export function createChallengeService(
           expiresAt: addMilliseconds(milliseconds, options.ttlMs),
           updatedAt: now,
         };
-        const reference = Object.freeze({
-          retentionId,
-          handleHash,
-          expiresAt: record.expiresAt,
-        });
-        let cursor: ChallengeRetentionCursor;
-        try {
-          // Track the harmless digest reference first. A crash can leave a
-          // stale reference, which sweep settles safely; it can never leave
-          // an authoritative challenge with no bounded path to retention.
-          cursor = retentionCursor(await options.retention.track(reference));
-        } catch (cause) {
-          throw new IdentityError(
-            "invalid_state",
-            "Challenge retention is unavailable.",
-            { cause },
-          );
-        }
         const inserted = await collection.insertIfAbsent(record);
         if (inserted.inserted) {
           return handle;
-        }
-        try {
-          await options.retention.complete(cursor);
-        } catch {
-          // A collision reference is safe to retain: its unique retention id
-          // cannot match the authoritative row and sweep will settle it.
         }
       }
       throw new IdentityError(
@@ -605,7 +479,7 @@ export function createChallengeService(
       );
     },
 
-    async sweep(limitInput = 100) {
+    async sweep(limitInput = 100, cursorInput) {
       if (
         !Number.isSafeInteger(limitInput) ||
         limitInput < 1 ||
@@ -613,147 +487,59 @@ export function createChallengeService(
       ) {
         throw new IdentityError("invalid_input", "Sweep limit is invalid.");
       }
+      const cursor =
+        cursorInput === undefined
+          ? undefined
+          : assertBoundedString(cursorInput, "Sweep cursor", 16_384);
       const now = timestampFromClock(options.clock).milliseconds;
-      const iterator = options.retention
-        .candidates(limitInput)
-        [Symbol.asyncIterator]();
-      let pulled = 0;
+      const page = scanPage(
+        await scanCollection.scan({
+          limit: limitInput,
+          ...(cursor === undefined ? {} : { cursor }),
+        }),
+        limitInput,
+      );
+      const pulled = page.records.length;
       let inspected = 0;
       let deleted = 0;
-      let completed = 0;
       let rejected = 0;
-      let sourceEnded = false;
-      let retryNeeded = false;
 
-      try {
-        while (pulled < limitInput) {
-          const next = await iterator.next();
-          if (next.done) {
-            sourceEnded = true;
-            break;
-          }
-          pulled += 1;
-          const candidate = retentionCandidate(next.value);
-          const reference = retentionReference(candidate.reference);
-          if (reference === null) {
-            rejected += 1;
-          }
-          inspected += 1;
-          const row = await collection.getVersioned(
-            challengeKey(candidate.locator.handleHash),
-          );
-          if (row === null) {
-            try {
-              await options.retention.complete(candidate.cursor);
-              completed += 1;
-            } catch {
-              retryNeeded = true;
-            }
-            continue;
-          }
-          const matchesLookup =
-            row.value.partition === "challenges" &&
-            row.value.id === candidate.locator.handleHash &&
-            row.value.handleHash === candidate.locator.handleHash &&
-            row.value.retentionId === candidate.locator.retentionId;
-          if (!matchesLookup) {
-            // Trusted locator metadata and authoritative storage disagree.
-            // Retain the pointer and fail closed rather than deriving any
-            // repair or deletion authority from the corrupt payload.
-            retryNeeded = true;
-            continue;
-          }
-          const authoritativeReference = Object.freeze({
-            retentionId: row.value.retentionId,
-            handleHash: row.value.handleHash,
-            expiresAt: row.value.expiresAt,
-          });
-          let authoritativeCursor = candidate.cursor;
-          let cursorConfirmed = false;
-          const referenceMatches =
-            reference !== null &&
-            reference.retentionId === candidate.locator.retentionId &&
-            reference.handleHash === candidate.locator.handleHash &&
-            reference.expiresAt === row.value.expiresAt;
-          if (!referenceMatches) {
-            try {
-              authoritativeCursor = retentionCursor(
-                await options.retention.track(authoritativeReference),
-              );
-            } catch {
-              retryNeeded = true;
-              continue;
-            }
-            if (authoritativeCursor !== candidate.cursor) {
-              try {
-                await options.retention.complete(candidate.cursor);
-                completed += 1;
-              } catch {
-                retryNeeded = true;
-              }
-              retryNeeded = true;
-              continue;
-            }
-            cursorConfirmed = true;
-          }
-          const removable =
-            Date.parse(row.value.expiresAt) <= now ||
-            row.value.state === "consumed" ||
-            row.value.state === "failed";
-          if (!cursorConfirmed) {
-            try {
-              authoritativeCursor = retentionCursor(
-                await options.retention.track(authoritativeReference),
-              );
-            } catch {
-              retryNeeded = true;
-              continue;
-            }
-            if (authoritativeCursor !== candidate.cursor) {
-              try {
-                await options.retention.complete(candidate.cursor);
-                completed += 1;
-              } catch {
-                retryNeeded = true;
-              }
-              retryNeeded = true;
-              continue;
-            }
-          }
-          if (!removable) {
-            retryNeeded = true;
-            continue;
-          }
-          const removed = await collection.deleteIfUnchanged(
-            challengeKey(candidate.locator.handleHash),
-            row.version,
-          );
-          if (!removed) {
-            retryNeeded = true;
-            continue;
-          }
-          deleted += 1;
-          try {
-            await options.retention.complete(authoritativeCursor);
-            completed += 1;
-          } catch {
-            // The now-stale reference is harmless and will be settled on
-            // retry.
-            retryNeeded = true;
-          }
+      for (const row of page.records) {
+        inspected += 1;
+        let challenge: ChallengeRecord;
+        try {
+          challenge = challengesCollection.codec.decode(row.value);
+        } catch {
+          rejected += 1;
+          continue;
         }
-      } finally {
-        if (!sourceEnded && iterator.return !== undefined) {
-          await iterator.return();
+        if (
+          row.key.partition !== challenge.partition ||
+          row.key.id !== challenge.id ||
+          challenge.partition !== "challenges" ||
+          challenge.id !== challenge.handleHash
+        ) {
+          rejected += 1;
+          continue;
+        }
+        const removable =
+          Date.parse(challenge.expiresAt) <= now ||
+          challenge.state === "consumed" ||
+          challenge.state === "failed";
+        if (
+          removable &&
+          (await collection.deleteIfUnchanged(row.key, row.version))
+        ) {
+          deleted += 1;
         }
       }
       return Object.freeze({
         pulled,
         inspected,
         deleted,
-        completed,
         rejected,
-        hasMore: retryNeeded || (!sourceEnded && pulled === limitInput),
+        cursor: page.nextCursor,
+        hasMore: page.nextCursor !== null,
       });
     },
   };

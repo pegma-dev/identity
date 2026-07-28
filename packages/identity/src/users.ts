@@ -16,6 +16,7 @@ import {
   assertPrincipalId,
   copyDataOnly,
   dataField,
+  readDataProperty,
   timestampFromClock,
 } from "./validation.js";
 
@@ -92,6 +93,21 @@ export function createUserService(options: UserServiceOptions): UserService {
   const users = options.store.collection(usersCollection);
   const indexes = options.store.collection(emailIndexesCollection);
 
+  async function assertEmailIndexOwner(index: EmailIndexRecord): Promise<void> {
+    const principalId = readDataProperty(index, "principalId");
+    const storedPrincipalHash = readDataProperty(index, "principalHash");
+    if (
+      typeof principalId !== "string" ||
+      typeof storedPrincipalHash !== "string" ||
+      storedPrincipalHash !== (await principalHash(principalId))
+    ) {
+      throw new IdentityError(
+        "storage_corrupt",
+        "Email index owner is malformed.",
+      );
+    }
+  }
+
   async function readUser(
     principalId: string,
     expectedHash?: string,
@@ -145,10 +161,11 @@ export function createUserService(options: UserServiceOptions): UserService {
   ): Promise<EmailIndexRecord> {
     const result = await indexes.update(
       emailKey(index.emailHash),
-      (current) => {
+      async (current) => {
         if (current === null) {
           return { action: "keep" };
         }
+        await assertEmailIndexOwner(current);
         if (
           current.operationId !== index.operationId ||
           current.principalId !== index.principalId ||
@@ -223,6 +240,7 @@ export function createUserService(options: UserServiceOptions): UserService {
   async function repair(index: EmailIndexRecord): Promise<UserRecord> {
     let current = index;
     for (let step = 0; step < 6; step += 1) {
+      await assertEmailIndexOwner(current);
       const now = timestampFromClock(options.clock).value;
       switch (current.state) {
         case "reserved": {
@@ -239,6 +257,7 @@ export function createUserService(options: UserServiceOptions): UserService {
               seen.value.state === "reserved" &&
               seen.value.operationId === current.operationId
             ) {
+              await assertEmailIndexOwner(seen.value);
               await indexes.deleteIfUnchanged(
                 emailKey(current.emailHash),
                 seen.version,

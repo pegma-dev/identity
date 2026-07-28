@@ -12,13 +12,13 @@ import {
 import { describe, expect, it } from "vitest";
 
 import { TABLE_PORT } from "../../../test/azurite.js";
+import { createIdentity, IdentityError, normalizeEmail } from "./index.js";
+import { emailHash } from "./crypto.js";
 import {
-  createIdentity,
-  createMemoryChallengeRetention,
-  IdentityError,
-  normalizeEmail,
-} from "./index.js";
-import { challengesCollection, usersCollection } from "./records.js";
+  challengesCollection,
+  emailIndexesCollection,
+  usersCollection,
+} from "./records.js";
 
 const CONNECTION_STRING =
   "DefaultEndpointsProtocol=http;" +
@@ -49,7 +49,6 @@ function identity(store: Store, newId = () => randomUUID()) {
     origins: ["https://example.test"],
     registrationLimiter: allow,
     authenticationLimiter: allow,
-    challengeRetention: createMemoryChallengeRetention(),
     clock: fixedClock("2026-07-27T12:00:00.000Z"),
     newId,
   });
@@ -70,20 +69,6 @@ describe("identity construction", () => {
 
     expect(() => createIdentity(options)).toThrow(IdentityError);
     expect(getters).toBe(0);
-  });
-
-  it("rejects an absent challenge retention policy during construction", () => {
-    expect(() =>
-      createIdentity({
-        store: createMemoryStore(),
-        issuer: "https://issuer.example",
-        rpName: "Example",
-        rpID: "example.test",
-        origins: ["https://example.test"],
-        registrationLimiter: allow,
-        authenticationLimiter: allow,
-      } as never),
-    ).toThrow(IdentityError);
   });
 });
 
@@ -307,6 +292,155 @@ describe("repair and hostile input", () => {
     });
   });
 
+  it("rejects an owner-digest substitution during an index transition", async () => {
+    const inner = createMemoryStore();
+    let failIndexTransition = true;
+    const crashing: Store = {
+      collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
+        const collection = inner.collection(definition);
+        if (definition.name !== "pegma_identity_email_indexes") {
+          return collection;
+        }
+        return {
+          ...collection,
+          async update(key, decide, options) {
+            if (failIndexTransition) {
+              failIndexTransition = false;
+              throw new Error("simulated crash");
+            }
+            return collection.update(key, decide, options);
+          },
+        };
+      },
+    };
+    await expect(
+      identity(crashing).provisionVerifiedUser({
+        principalId: "concurrent-corruption-principal",
+        email: "concurrent-corruption@example.test",
+      }),
+    ).rejects.toThrow("simulated crash");
+
+    let writeDecisions = 0;
+    const substituting: Store = {
+      collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
+        const collection = inner.collection(definition);
+        if (definition.name !== "pegma_identity_email_indexes") {
+          return collection;
+        }
+        return {
+          ...collection,
+          async update(key, decide, options) {
+            return collection.update(
+              key,
+              async (current) => {
+                if (current === null) {
+                  return decide(current);
+                }
+                const corrupt = {
+                  ...current,
+                  principalHash: "f".repeat(64),
+                };
+                const decision = await decide(corrupt);
+                if (decision.action === "write") {
+                  writeDecisions += 1;
+                }
+                return decision;
+              },
+              options,
+            );
+          },
+        };
+      },
+    };
+
+    await expect(
+      identity(substituting).repairUserByEmail(
+        "concurrent-corruption@example.test",
+      ),
+    ).rejects.toMatchObject({ code: "storage_corrupt" });
+    expect(writeDecisions).toBe(0);
+  });
+
+  it.each([
+    ["memory store", createMemoryStore],
+    ["Azurite", createAzuriteStore],
+  ] as const)(
+    "rejects a mismatched email-index principal hash before any repair write over %s",
+    async (_name, makeStore) => {
+      const inner = makeStore();
+      const initial = identity(inner);
+      await initial.provisionVerifiedUser({
+        principalId: "principal-email-index-corruption",
+        email: "corrupt-index@example.test",
+      });
+      const digest = await emailHash("corrupt-index@example.test");
+      const indexes = inner.collection(emailIndexesCollection);
+      const key = {
+        partition: `email-${digest.slice(0, 16)}`,
+        id: digest,
+      };
+      const original = await indexes.get(key);
+      if (original === null) {
+        throw new Error("expected an email index");
+      }
+      const corruptHash =
+        original.principalHash === "f".repeat(64)
+          ? "e".repeat(64)
+          : "f".repeat(64);
+      await indexes.put({ ...original, principalHash: corruptHash });
+
+      let mutations = 0;
+      const observed: Store = {
+        collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
+          const collection = inner.collection(definition);
+          return {
+            ...collection,
+            async insertIfAbsent(value) {
+              mutations += 1;
+              return collection.insertIfAbsent(value);
+            },
+            async put(value) {
+              mutations += 1;
+              return collection.put(value);
+            },
+            async putIfUnchanged(value, version) {
+              mutations += 1;
+              return collection.putIfUnchanged(value, version);
+            },
+            async update(updateKey, decide, options) {
+              mutations += 1;
+              return options === undefined
+                ? collection.update(updateKey, decide)
+                : collection.update(updateKey, decide, options);
+            },
+            async delete(deleteKey) {
+              mutations += 1;
+              return collection.delete(deleteKey);
+            },
+            async deleteIfUnchanged(deleteKey, version) {
+              mutations += 1;
+              return collection.deleteIfUnchanged(deleteKey, version);
+            },
+            async transact(partition, actions) {
+              mutations += 1;
+              return collection.transact(partition, actions);
+            },
+          };
+        },
+      };
+
+      await expect(
+        identity(observed).repairUserByEmail("CORRUPT-INDEX@example.test"),
+      ).rejects.toMatchObject({ code: "storage_corrupt" });
+      expect(mutations).toBe(0);
+      await expect(indexes.get(key)).resolves.toMatchObject({
+        principalId: original.principalId,
+        principalHash: corruptHash,
+        state: "active",
+      });
+    },
+  );
+
   it("rejects accessor-bearing inputs without executing getters", async () => {
     let getters = 0;
     const input = Object.create(null, {
@@ -360,7 +494,6 @@ describe("repair and hostile input", () => {
       partition: "challenges",
       id: "a".repeat(64),
       handleHash: "a".repeat(64),
-      retentionId: "b".repeat(64),
       challengeHash: "c".repeat(64),
       kind: "authentication",
       state: "pending",
@@ -390,7 +523,6 @@ describe("repair and hostile input", () => {
         partition: "challenges",
         id: "a".repeat(64),
         handleHash: "a".repeat(64),
-        retentionId: "b".repeat(64),
         challengeHash: "c".repeat(64),
         kind: "authentication",
         principalId: null,

@@ -101,14 +101,7 @@ vi.mock("@simplewebauthn/server", () => ({
   },
 }));
 
-import {
-  createIdentity,
-  createMemoryChallengeRetention,
-  IdentityError,
-  type ChallengeRetention,
-  type ChallengeRetentionLocator,
-  type ChallengeRetentionReference,
-} from "./index.js";
+import { createIdentity, IdentityError } from "./index.js";
 import {
   challengeHandleHash,
   credentialHash,
@@ -218,361 +211,6 @@ function observeStore(inner: Store) {
   };
 }
 
-interface InspectableRetention extends ChallengeRetention {
-  corrupt(cursor: string, reference: unknown): Promise<void>;
-  corruptDue(cursor: string, expiresAt: string): Promise<void>;
-  inject(
-    cursor: string,
-    locator: ChallengeRetentionLocator,
-    reference: unknown,
-  ): Promise<void>;
-  failNextTrack(): void;
-  peek(cursor: string): Promise<unknown | null>;
-  peekDue(cursor: string): Promise<string | null>;
-  cursors(): readonly string[];
-}
-
-interface RetentionHarness {
-  readonly name: string;
-  create(): {
-    readonly store: Store;
-    readonly retention: InspectableRetention;
-  };
-}
-
-function createInspectableMemoryRetention(): InspectableRetention {
-  const references = new Map<
-    string,
-    {
-      readonly locator: ChallengeRetentionLocator;
-      readonly reference: unknown;
-      readonly expiresAt: string;
-    }
-  >();
-  const order: string[] = [];
-  let nextCursor: string | null = null;
-  let rejectNextTrack = false;
-  return {
-    async track(reference) {
-      if (rejectNextTrack) {
-        rejectNextTrack = false;
-        throw new Error("retention track failed");
-      }
-      if (!references.has(reference.retentionId)) {
-        order.unshift(reference.retentionId);
-      }
-      references.set(reference.retentionId, {
-        locator: {
-          retentionId: reference.retentionId,
-          handleHash: reference.handleHash,
-        },
-        reference: Object.freeze({ ...reference }),
-        expiresAt: reference.expiresAt,
-      });
-      return reference.retentionId;
-    },
-    async *candidates(limit) {
-      const cursors = order.filter((cursor) => references.has(cursor));
-      if (cursors.length === 0) {
-        return;
-      }
-      let position =
-        nextCursor === null ? 0 : Math.max(0, cursors.indexOf(nextCursor));
-      let yielded = 0;
-      while (yielded < limit && yielded < cursors.length) {
-        const cursor = cursors[position];
-        if (cursor === undefined) {
-          break;
-        }
-        position = (position + 1) % cursors.length;
-        nextCursor = cursors[position] ?? null;
-        const entry = references.get(cursor);
-        if (entry === undefined) {
-          continue;
-        }
-        yielded += 1;
-        yield {
-          cursor,
-          locator: entry.locator,
-          reference: entry.reference,
-        };
-      }
-    },
-    async complete(cursor) {
-      if (nextCursor === cursor) {
-        const position = order.indexOf(cursor);
-        nextCursor =
-          order.length <= 1 || position === -1
-            ? null
-            : (order[(position + 1) % order.length] ?? null);
-      }
-      references.delete(cursor);
-      const index = order.indexOf(cursor);
-      if (index !== -1) {
-        order.splice(index, 1);
-      }
-    },
-    async corrupt(cursor, reference) {
-      if (!references.has(cursor)) {
-        throw new Error("retention cursor was not found");
-      }
-      const entry = references.get(cursor);
-      if (entry === undefined) {
-        throw new Error("retention cursor was not found");
-      }
-      references.set(cursor, { ...entry, reference });
-    },
-    async corruptDue(cursor, expiresAt) {
-      const entry = references.get(cursor);
-      if (entry === undefined) {
-        throw new Error("retention cursor was not found");
-      }
-      references.set(cursor, { ...entry, expiresAt });
-    },
-    async inject(cursor, locator, reference) {
-      if (!references.has(cursor)) {
-        order.unshift(cursor);
-      }
-      references.set(cursor, {
-        locator,
-        reference,
-        expiresAt: "1970-01-01T00:00:00.000Z",
-      });
-    },
-    failNextTrack() {
-      rejectNextTrack = true;
-    },
-    async peek(cursor) {
-      return references.get(cursor)?.reference ?? null;
-    },
-    async peekDue(cursor) {
-      return references.get(cursor)?.expiresAt ?? null;
-    },
-    cursors() {
-      return [...order];
-    },
-  };
-}
-
-interface StoredRetentionRecord {
-  readonly partition: string;
-  readonly id: string;
-  readonly expiresAt: string;
-  readonly payload: string;
-}
-
-const storedRetentionCollection = defineCollection<StoredRetentionRecord>({
-  name: "pegma_identity_test_retention",
-  key: ({ partition, id }) => ({ partition, id }),
-  codec: {
-    encode: (value) => ({ ...value }),
-    decode(record: StoredRecord) {
-      const partition = Object.getOwnPropertyDescriptor(record, "partition");
-      const id = Object.getOwnPropertyDescriptor(record, "id");
-      const expiresAt = Object.getOwnPropertyDescriptor(record, "expiresAt");
-      const payload = Object.getOwnPropertyDescriptor(record, "payload");
-      if (
-        partition === undefined ||
-        !("value" in partition) ||
-        typeof partition.value !== "string" ||
-        !partition.value.startsWith("retention-") ||
-        id === undefined ||
-        !("value" in id) ||
-        typeof id.value !== "string" ||
-        expiresAt === undefined ||
-        !("value" in expiresAt) ||
-        typeof expiresAt.value !== "string" ||
-        payload === undefined ||
-        !("value" in payload) ||
-        typeof payload.value !== "string"
-      ) {
-        throw new Error("stored retention record is malformed");
-      }
-      return {
-        partition: partition.value,
-        id: id.value,
-        expiresAt: expiresAt.value,
-        payload: payload.value,
-      };
-    },
-  },
-});
-
-function storedRetentionCursor(locator: ChallengeRetentionLocator): string {
-  return `${locator.retentionId}:${locator.handleHash}`;
-}
-
-function storedRetentionLocator(cursor: string): ChallengeRetentionLocator {
-  const [retentionId, handleHash, extra] = cursor.split(":");
-  if (
-    retentionId === undefined ||
-    handleHash === undefined ||
-    extra !== undefined
-  ) {
-    throw new Error("retention cursor is malformed");
-  }
-  return { retentionId, handleHash };
-}
-
-function storedRetentionKey(locator: ChallengeRetentionLocator) {
-  return {
-    partition: `retention-${locator.retentionId}`,
-    id: locator.handleHash,
-  };
-}
-
-function createStoredRetention(store: Store): InspectableRetention {
-  const records = store.collection(storedRetentionCollection);
-  const order: string[] = [];
-  const trustedExpiry = new Map<string, string>();
-  let nextCursor: string | null = null;
-  let rejectNextTrack = false;
-  const write = async (
-    locator: ChallengeRetentionLocator,
-    reference: unknown,
-    expiresAt: string,
-  ) => {
-    const key = storedRetentionKey(locator);
-    await records.put({
-      ...key,
-      expiresAt,
-      payload: JSON.stringify(reference),
-    });
-  };
-  return {
-    async track(reference) {
-      if (rejectNextTrack) {
-        rejectNextTrack = false;
-        throw new Error("retention track failed");
-      }
-      const locator = {
-        retentionId: reference.retentionId,
-        handleHash: reference.handleHash,
-      };
-      const cursor = storedRetentionCursor(locator);
-      if (!order.includes(cursor)) {
-        order.unshift(cursor);
-      }
-      trustedExpiry.set(cursor, reference.expiresAt);
-      await write(locator, reference, reference.expiresAt);
-      return cursor;
-    },
-    async *candidates(limit) {
-      const cursors = order.filter((cursor) => trustedExpiry.has(cursor));
-      if (cursors.length === 0) {
-        return;
-      }
-      let position =
-        nextCursor === null ? 0 : Math.max(0, cursors.indexOf(nextCursor));
-      let yielded = 0;
-      while (yielded < limit && yielded < cursors.length) {
-        const cursor = cursors[position];
-        if (cursor === undefined) {
-          break;
-        }
-        position = (position + 1) % cursors.length;
-        nextCursor = cursors[position] ?? null;
-        const locator = storedRetentionLocator(cursor);
-        const record = await records.get(storedRetentionKey(locator));
-        if (record === null) {
-          continue;
-        }
-        yielded += 1;
-        yield {
-          // Cursor and locator come from host metadata, never payload JSON.
-          cursor: storedRetentionCursor({
-            retentionId: record.partition.slice("retention-".length),
-            handleHash: record.id,
-          }),
-          locator: {
-            retentionId: record.partition.slice("retention-".length),
-            handleHash: record.id,
-          },
-          reference: JSON.parse(record.payload) as unknown,
-        };
-      }
-    },
-    async complete(cursor) {
-      if (nextCursor === cursor) {
-        const position = order.indexOf(cursor);
-        nextCursor =
-          order.length <= 1 || position === -1
-            ? null
-            : (order[(position + 1) % order.length] ?? null);
-      }
-      await records.delete(storedRetentionKey(storedRetentionLocator(cursor)));
-      trustedExpiry.delete(cursor);
-      const index = order.indexOf(cursor);
-      if (index !== -1) {
-        order.splice(index, 1);
-      }
-    },
-    async corrupt(cursor, reference) {
-      const locator = storedRetentionLocator(cursor);
-      const record = await records.get(storedRetentionKey(locator));
-      if (record === null) {
-        throw new Error("retention cursor was not found");
-      }
-      await write(locator, reference, record.expiresAt);
-    },
-    async corruptDue(cursor, expiresAt) {
-      const locator = storedRetentionLocator(cursor);
-      const record = await records.get(storedRetentionKey(locator));
-      if (record === null) {
-        throw new Error("retention cursor was not found");
-      }
-      trustedExpiry.set(cursor, expiresAt);
-      await write(locator, JSON.parse(record.payload) as unknown, expiresAt);
-    },
-    async inject(cursor, locator, reference) {
-      if (cursor !== storedRetentionCursor(locator)) {
-        throw new Error("retention cursor does not match locator metadata");
-      }
-      if (!order.includes(cursor)) {
-        order.unshift(cursor);
-      }
-      trustedExpiry.set(cursor, "1970-01-01T00:00:00.000Z");
-      await write(locator, reference, "1970-01-01T00:00:00.000Z");
-    },
-    failNextTrack() {
-      rejectNextTrack = true;
-    },
-    async peek(cursor) {
-      const record = await records.get(
-        storedRetentionKey(storedRetentionLocator(cursor)),
-      );
-      return record === null ? null : (JSON.parse(record.payload) as unknown);
-    },
-    async peekDue(cursor) {
-      const locator = storedRetentionLocator(cursor);
-      const record = await records.get(storedRetentionKey(locator));
-      return record?.expiresAt ?? null;
-    },
-    cursors() {
-      return [...order];
-    },
-  };
-}
-
-const retentionHarnesses: readonly RetentionHarness[] = [
-  {
-    name: "memory",
-    create() {
-      return {
-        store: createMemoryStore(),
-        retention: createInspectableMemoryRetention(),
-      };
-    },
-  },
-  {
-    name: "host-like stored adapter on Azurite",
-    create() {
-      const store = createAzuriteStore();
-      return { store, retention: createStoredRetention(store) };
-    },
-  },
-];
-
 function registrationResponse() {
   return {
     id: ceremony.credentialId,
@@ -608,7 +246,6 @@ function service(
     readonly clock?: Clock;
     readonly newId?: () => string;
     readonly authenticationLimiter?: RateLimiter;
-    readonly challengeRetention?: ChallengeRetention;
   } = {},
 ) {
   return createIdentity({
@@ -619,8 +256,6 @@ function service(
     origins: ["https://example.test"],
     registrationLimiter: allow,
     authenticationLimiter: options.authenticationLimiter ?? allow,
-    challengeRetention:
-      options.challengeRetention ?? createMemoryChallengeRetention(),
     newId: options.newId ?? (() => randomUUID()),
     ...(options.clock === undefined ? {} : { clock: options.clock }),
   });
@@ -1117,6 +752,154 @@ describe("passkey ceremonies", () => {
     ["memory store", createMemoryStore],
     ["Azurite", createAzuriteStore],
   ] as const)(
+    "repairs a crash after credential reservation but before the passkey mirror over %s",
+    async (_name, makeStore) => {
+      const inner = makeStore();
+      let crashBeforeMirror = true;
+      const crashing: Store = {
+        collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
+          const collection = inner.collection(definition);
+          if (definition.name !== "pegma_identity_passkeys") {
+            return collection;
+          }
+          return {
+            ...collection,
+            async update(key, decide, options) {
+              if (crashBeforeMirror) {
+                crashBeforeMirror = false;
+                throw new Error("simulated reserved-before-mirror crash");
+              }
+              return options === undefined
+                ? collection.update(key, decide)
+                : collection.update(key, decide, options);
+            },
+          };
+        },
+      };
+      const interrupted = service(crashing);
+      const principalId = await provision(interrupted);
+      const registration = await interrupted.beginPasskeyRegistration(
+        principalId,
+        "interrupted-registration",
+      );
+
+      await expect(
+        interrupted.finishPasskeyRegistration({
+          principalId,
+          challengeHandle: registration.challengeHandle,
+          label: "Interrupted key",
+          response: registrationResponse(),
+        }),
+      ).rejects.toMatchObject({ code: "invalid_state" });
+
+      const restarted = service(inner);
+      await expect(
+        restarted.repairPasskey(ceremony.credentialId),
+      ).resolves.toMatchObject({
+        credentialId: ceremony.credentialId,
+        label: "Interrupted key",
+      });
+      await expect(
+        restarted.removePasskey(principalId, ceremony.credentialId),
+      ).resolves.toBe(true);
+
+      const replacement = await restarted.beginPasskeyRegistration(
+        principalId,
+        "replacement-registration",
+      );
+      await expect(
+        restarted.finishPasskeyRegistration({
+          principalId,
+          challengeHandle: replacement.challengeHandle,
+          label: "Replacement key",
+          response: registrationResponse(),
+        }),
+      ).resolves.toMatchObject({
+        credentialId: ceremony.credentialId,
+        label: "Replacement key",
+      });
+    },
+  );
+
+  it.each([
+    ["memory store", createMemoryStore],
+    ["Azurite", createAzuriteStore],
+  ] as const)(
+    "rejects owner-pair substitution of an interrupted reservation without writing over %s",
+    async (_name, makeStore) => {
+      const inner = makeStore();
+      let crashBeforeMirror = true;
+      const crashing: Store = {
+        collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
+          const collection = inner.collection(definition);
+          if (definition.name !== "pegma_identity_passkeys") {
+            return collection;
+          }
+          return {
+            ...collection,
+            async update(key, decide, options) {
+              if (crashBeforeMirror) {
+                crashBeforeMirror = false;
+                throw new Error("simulated reserved-before-mirror crash");
+              }
+              return options === undefined
+                ? collection.update(key, decide)
+                : collection.update(key, decide, options);
+            },
+          };
+        },
+      };
+      const interrupted = service(crashing);
+      const attackerPrincipalId = await provision(interrupted);
+      const registration = await interrupted.beginPasskeyRegistration(
+        attackerPrincipalId,
+        "interrupted-registration",
+      );
+      await expect(
+        interrupted.finishPasskeyRegistration({
+          principalId: attackerPrincipalId,
+          challengeHandle: registration.challengeHandle,
+          label: "Interrupted key",
+          response: registrationResponse(),
+        }),
+      ).rejects.toMatchObject({ code: "invalid_state" });
+
+      const credentialDigest = await credentialHash(ceremony.credentialId);
+      const credentials = inner.collection(credentialIndexesCollection);
+      const key = {
+        partition: `credential-${credentialDigest.slice(0, 16)}`,
+        id: credentialDigest,
+      };
+      const original = await credentials.get(key);
+      if (original === null) {
+        throw new Error("expected a reserved credential index");
+      }
+      const victimPrincipalId = "principal-reservation-victim" as PrincipalId;
+      await credentials.put({
+        ...original,
+        principalId: victimPrincipalId,
+        principalHash: await principalHash(victimPrincipalId),
+      });
+      const observed = observeStore(inner);
+      observed.arm();
+
+      await expect(
+        service(observed.store).repairPasskey(ceremony.credentialId),
+      ).rejects.toMatchObject({ code: "storage_corrupt" });
+      expect(observed.mutations()).toBe(0);
+      await expect(
+        inner.collection(credentialIndexesCollection).get(key),
+      ).resolves.toMatchObject({
+        state: "reserved",
+        principalId: victimPrincipalId,
+      });
+    },
+  );
+
+  it.each([
+    ["memory store", createMemoryStore],
+    ["Azurite", createAzuriteStore],
+  ] as const)(
     "lets only one concurrent re-registration own a revoked credential over %s",
     async (_name, makeStore) => {
       const inner = makeStore();
@@ -1237,7 +1020,147 @@ describe("passkey ceremonies", () => {
   );
 });
 
-describe("challenge controls", () => {
+describe.each([
+  {
+    name: "memory store",
+    create() {
+      const store = createMemoryStore();
+      return { nextStore: () => store };
+    },
+  },
+  {
+    name: "Azurite",
+    create() {
+      const table = `identityscan${randomUUID().replaceAll("-", "")}`;
+      const client = TableClient.fromConnectionString(
+        CONNECTION_STRING,
+        table,
+        {
+          allowInsecureConnection: true,
+        },
+      );
+      return {
+        nextStore: () => createAzureTablesStore({ client }),
+      };
+    },
+  },
+])("authoritative challenge sweep over $name", ({ create }) => {
+  it("reaches a quiescent cycle boundary with only live rows at limit one", async () => {
+    const { nextStore } = create();
+    let now = "2026-07-27T12:00:00.000Z";
+    const writer = service(nextStore(), { clock: { now: () => now } });
+    await writer.beginPasskeyAuthentication("live-one");
+    await writer.beginPasskeyAuthentication("live-two");
+    await writer.beginPasskeyAuthentication("live-three");
+
+    let cursor: string | undefined;
+    const results = [];
+    do {
+      const restarted = service(nextStore(), { clock: { now: () => now } });
+      const result = await restarted.sweepChallenges(1, cursor);
+      results.push(result);
+      cursor = result.cursor ?? undefined;
+    } while (results.at(-1)?.hasMore);
+
+    expect(results).toHaveLength(3);
+    expect(results.every(({ pulled }) => pulled <= 1)).toBe(true);
+    expect(results.reduce((sum, { deleted }) => sum + deleted, 0)).toBe(0);
+    expect(results.at(-1)).toMatchObject({ cursor: null, hasMore: false });
+  });
+
+  it("drains expired rows among live rows across restarted services", async () => {
+    const { nextStore } = create();
+    let now = "2026-07-27T12:00:00.000Z";
+    const writer = service(nextStore(), { clock: { now: () => now } });
+    await writer.beginPasskeyAuthentication("expired");
+    now = "2026-07-27T12:06:00.000Z";
+    await writer.beginPasskeyAuthentication("live-one");
+    await writer.beginPasskeyAuthentication("live-two");
+
+    let cursor: string | undefined;
+    let deleted = 0;
+    let passes = 0;
+    do {
+      const restarted = service(nextStore(), { clock: { now: () => now } });
+      const result = await restarted.sweepChallenges(1, cursor);
+      expect(result.pulled).toBeLessThanOrEqual(1);
+      deleted += result.deleted;
+      passes += 1;
+      cursor = result.cursor ?? undefined;
+      if (!result.hasMore) {
+        break;
+      }
+    } while (passes < 10);
+
+    expect(passes).toBeLessThan(10);
+    expect(deleted).toBe(1);
+    expect(cursor).toBeUndefined();
+    await expect(
+      nextStore().collection(challengesCollection).list("challenges"),
+    ).resolves.toHaveLength(2);
+  });
+
+  it("makes concurrent sweeper replays repeat-safe", async () => {
+    const { nextStore } = create();
+    let now = "2026-07-27T12:00:00.000Z";
+    const writer = service(nextStore(), { clock: { now: () => now } });
+    await writer.beginPasskeyAuthentication("expired-one");
+    await writer.beginPasskeyAuthentication("expired-two");
+    now = "2026-07-27T12:06:00.000Z";
+    let arrivals = 0;
+    let releaseScans!: () => void;
+    const bothScanned = new Promise<void>((resolve) => {
+      releaseScans = resolve;
+    });
+    const racingStore = (): Store => {
+      const inner = nextStore();
+      return {
+        collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
+          const collection = inner.collection(definition);
+          if (definition.name !== "pegma_identity_challenges") {
+            return collection;
+          }
+          return {
+            ...collection,
+            async scan(options) {
+              const page = await collection.scan(options);
+              arrivals += 1;
+              if (arrivals === 2) {
+                releaseScans();
+              }
+              await bothScanned;
+              return page;
+            },
+          };
+        },
+      };
+    };
+
+    const [first, second] = await Promise.all([
+      service(racingStore(), { clock: { now: () => now } }).sweepChallenges(1),
+      service(racingStore(), { clock: { now: () => now } }).sweepChallenges(1),
+    ]);
+
+    expect(first.deleted + second.deleted).toBe(1);
+    expect(first.cursor).toBe(second.cursor);
+    let cursor = first.cursor ?? undefined;
+    let deleted = first.deleted + second.deleted;
+    for (let pass = 0; pass < 5; pass += 1) {
+      const result = await service(nextStore(), {
+        clock: { now: () => now },
+      }).sweepChallenges(1, cursor);
+      deleted += result.deleted;
+      cursor = result.cursor ?? undefined;
+      if (!result.hasMore) {
+        break;
+      }
+    }
+    expect(deleted).toBe(2);
+    expect(cursor).toBeUndefined();
+  });
+});
+
+describe("authoritative challenge scan controls", () => {
   it("stores only hashes of handles and WebAuthn challenges", async () => {
     const stored: unknown[] = [];
     const inner = createMemoryStore();
@@ -1299,383 +1222,10 @@ describe("challenge controls", () => {
     expect(String(error)).not.toContain(ceremony.authenticationChallenge);
   });
 
-  it("sweeps expired challenges with a bounded version-conditional pass", async () => {
-    let now = "2026-07-27T12:00:00.000Z";
-    const identity = service(createMemoryStore(), {
-      clock: { now: () => now },
-    });
-    await identity.beginPasskeyAuthentication("request");
-    now = "2026-07-27T12:06:00.000Z";
-
-    await expect(identity.sweepChallenges(1)).resolves.toEqual({
-      pulled: 1,
-      inspected: 1,
-      deleted: 1,
-      completed: 1,
-      rejected: 0,
-      hasMore: true,
-    });
-    await expect(identity.sweepChallenges(1)).resolves.toEqual({
-      pulled: 0,
-      inspected: 0,
-      deleted: 0,
-      completed: 0,
-      rejected: 0,
-      hasMore: false,
-    });
-  });
-
-  it.each(retentionHarnesses)(
-    "uses trusted $name due metadata when the stored expiry payload was corrupted",
-    async ({ create }) => {
-      let now = "2026-07-27T12:00:00.000Z";
-      const { store, retention } = create();
-      const identity = service(store, {
-        clock: { now: () => now },
-        challengeRetention: retention,
-      });
-      await identity.beginPasskeyAuthentication("request");
-      const cursor = retention.cursors()[0];
-      if (cursor === undefined) {
-        throw new Error("expected a retention cursor");
-      }
-      const tracked = (await retention.peek(
-        cursor,
-      )) as ChallengeRetentionReference;
-      await retention.corrupt(cursor, {
-        ...tracked,
-        expiresAt: "2026-07-27T12:04:00.000Z",
-      });
-      now = "2026-07-27T12:06:00.000Z";
-
-      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
-        pulled: 1,
-        inspected: 1,
-        deleted: 1,
-        completed: 1,
-        rejected: 0,
-        hasMore: true,
-      });
-      await expect(retention.peek(cursor)).resolves.toBeNull();
-    },
-  );
-
-  it.each(retentionHarnesses)(
-    "repairs an early-due live $name entry without starving older expired work",
-    async ({ create }) => {
-      let now = "2026-07-27T12:00:00.000Z";
-      const { store, retention } = create();
-      const identity = service(store, {
-        clock: { now: () => now },
-        challengeRetention: retention,
-      });
-      for (const key of ["expired-one", "expired-two", "expired-three"]) {
-        await identity.beginPasskeyAuthentication(key);
-      }
-      const expiredCursors = [...retention.cursors()];
-
-      now = "2026-07-27T12:06:00.000Z";
-      await identity.beginPasskeyAuthentication("live-one");
-      const earlyDueCursor = retention.cursors()[0];
-      if (earlyDueCursor === undefined) {
-        throw new Error("expected a live retention cursor");
-      }
-      await retention.corruptDue(earlyDueCursor, "2026-07-27T12:01:00.000Z");
-      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
-        pulled: 1,
-        inspected: 1,
-        deleted: 0,
-        completed: 0,
-        hasMore: true,
-      });
-      await expect(retention.peekDue(earlyDueCursor)).resolves.toBe(
-        "2026-07-27T12:11:00.000Z",
-      );
-
-      for (const key of ["live-two", "live-three", "live-four"]) {
-        // The adapter is newest-first, and every pass adds another live entry
-        // ahead of the remaining expired work.
-        await identity.beginPasskeyAuthentication(key);
-        await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
-          pulled: 1,
-          inspected: 1,
-          deleted: 1,
-          completed: 1,
-        });
-      }
-
-      await Promise.all(
-        expiredCursors.map(async (cursor) =>
-          expect(retention.peek(cursor)).resolves.toBeNull(),
-        ),
-      );
-      expect(retention.cursors()).toHaveLength(4);
-    },
-  );
-
-  it.each(retentionHarnesses)(
-    "audits past late-due corruption and reaches an expired $name entry",
-    async ({ create }) => {
-      let now = "2026-07-27T12:00:00.000Z";
-      const { store, retention } = create();
-      const identity = service(store, {
-        clock: { now: () => now },
-        challengeRetention: retention,
-      });
-      await identity.beginPasskeyAuthentication("expired");
-      const expiredCursor = retention.cursors()[0];
-      if (expiredCursor === undefined) {
-        throw new Error("expected an expired retention cursor");
-      }
-      await retention.corruptDue(expiredCursor, "2099-01-01T00:00:00.000Z");
-
-      now = "2026-07-27T12:06:00.000Z";
-      await identity.beginPasskeyAuthentication("live-one");
-      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
-        pulled: 1,
-        inspected: 1,
-        deleted: 0,
-      });
-      await identity.beginPasskeyAuthentication("live-two");
-      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
-        pulled: 1,
-        inspected: 1,
-        deleted: 1,
-        completed: 1,
-      });
-      await expect(retention.peek(expiredCursor)).resolves.toBeNull();
-    },
-  );
-
-  it.each(retentionHarnesses)(
-    "retains a live $name pointer when early-due repair fails",
-    async ({ create }) => {
-      const { store, retention } = create();
-      const identity = service(store, {
-        clock: { now: () => "2026-07-27T12:00:00.000Z" },
-        challengeRetention: retention,
-      });
-      await identity.beginPasskeyAuthentication("live");
-      const cursor = retention.cursors()[0];
-      if (cursor === undefined) {
-        throw new Error("expected a live retention cursor");
-      }
-      await retention.corruptDue(cursor, "1970-01-01T00:00:00.000Z");
-      retention.failNextTrack();
-
-      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
-        pulled: 1,
-        inspected: 1,
-        deleted: 0,
-        completed: 0,
-        hasMore: true,
-      });
-      await expect(retention.peek(cursor)).resolves.not.toBeNull();
-      await expect(retention.peekDue(cursor)).resolves.toBe(
-        "1970-01-01T00:00:00.000Z",
-      );
-
-      await identity.sweepChallenges(1);
-      await expect(retention.peekDue(cursor)).resolves.toBe(
-        "2026-07-27T12:05:00.000Z",
-      );
-    },
-  );
-
-  it.each(retentionHarnesses)(
-    "repairs and sweeps a $name entry whose payload expiry is syntactically malformed",
-    async ({ create }) => {
-      let now = "2026-07-27T12:00:00.000Z";
-      const { store, retention } = create();
-      const identity = service(store, {
-        clock: { now: () => now },
-        challengeRetention: retention,
-      });
-      await identity.beginPasskeyAuthentication("request");
-      const cursor = retention.cursors()[0];
-      if (cursor === undefined) {
-        throw new Error("expected a retention cursor");
-      }
-      const tracked = (await retention.peek(
-        cursor,
-      )) as ChallengeRetentionReference;
-      await retention.corrupt(cursor, {
-        ...tracked,
-        expiresAt: "not-a-timestamp",
-      });
-      now = "2026-07-27T12:06:00.000Z";
-
-      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
-        pulled: 1,
-        inspected: 1,
-        deleted: 1,
-        completed: 1,
-        rejected: 1,
-        hasMore: true,
-      });
-      await expect(retention.peek(cursor)).resolves.toBeNull();
-    },
-  );
-
-  it.each(retentionHarnesses)(
-    "retains the $name pointer when canonical repair tracking fails",
-    async ({ create }) => {
-      let now = "2026-07-27T12:00:00.000Z";
-      const { store, retention } = create();
-      const identity = service(store, {
-        clock: { now: () => now },
-        challengeRetention: retention,
-      });
-      await identity.beginPasskeyAuthentication("request");
-      const cursor = retention.cursors()[0];
-      if (cursor === undefined) {
-        throw new Error("expected a retention cursor");
-      }
-      const tracked = (await retention.peek(
-        cursor,
-      )) as ChallengeRetentionReference;
-      const corrupted = { ...tracked, expiresAt: "not-a-timestamp" };
-      await retention.corrupt(cursor, corrupted);
-      retention.failNextTrack();
-      now = "2026-07-27T12:06:00.000Z";
-
-      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
-        pulled: 1,
-        inspected: 1,
-        deleted: 0,
-        completed: 0,
-        rejected: 1,
-        hasMore: true,
-      });
-      await expect(retention.peek(cursor)).resolves.toEqual(corrupted);
-
-      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
-        deleted: 1,
-        completed: 1,
-      });
-      await expect(retention.peek(cursor)).resolves.toBeNull();
-    },
-  );
-
-  it.each(retentionHarnesses)(
-    "discards a malformed front entry by trusted $name cursor without starving the next challenge",
-    async ({ create }) => {
-      let now = "2026-07-27T12:00:00.000Z";
-      const { store, retention } = create();
-      const identity = service(store, {
-        clock: { now: () => now },
-        challengeRetention: retention,
-      });
-      await identity.beginPasskeyAuthentication("request");
-      const challengeCursor = retention.cursors()[0];
-      if (challengeCursor === undefined) {
-        throw new Error("expected a retention cursor");
-      }
-      const malformedLocator = {
-        retentionId: "d".repeat(64),
-        handleHash: "e".repeat(64),
-      };
-      const malformedCursor = storedRetentionCursor(malformedLocator);
-      await retention.inject(
-        malformedCursor,
-        malformedLocator,
-        "malformed payload",
-      );
-      now = "2026-07-27T12:06:00.000Z";
-
-      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
-        pulled: 1,
-        inspected: 1,
-        deleted: 0,
-        completed: 1,
-        rejected: 1,
-        hasMore: true,
-      });
-      await expect(retention.peek(malformedCursor)).resolves.toBeNull();
-
-      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
-        pulled: 1,
-        inspected: 1,
-        deleted: 1,
-        completed: 1,
-      });
-      await expect(retention.peek(challengeCursor)).resolves.toBeNull();
-    },
-  );
-
-  it.each(retentionHarnesses)(
-    "uses trusted $name locator metadata when one cursor payload is fully replaced by another",
-    async ({ create }) => {
-      let now = "2026-07-27T12:00:00.000Z";
-      const { store, retention } = create();
-      const identity = service(store, {
-        clock: { now: () => now },
-        challengeRetention: retention,
-      });
-      await identity.beginPasskeyAuthentication("first");
-      await identity.beginPasskeyAuthentication("second");
-      const [wrongCursor, unrelatedCursor] = retention.cursors();
-      if (wrongCursor === undefined || unrelatedCursor === undefined) {
-        throw new Error("expected two retention cursors");
-      }
-      const unrelated = (await retention.peek(
-        unrelatedCursor,
-      )) as ChallengeRetentionReference;
-      await retention.corrupt(wrongCursor, unrelated);
-      now = "2026-07-27T12:06:00.000Z";
-
-      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
-        pulled: 1,
-        inspected: 1,
-        deleted: 1,
-        completed: 1,
-        hasMore: true,
-      });
-      await expect(retention.peek(wrongCursor)).resolves.toBeNull();
-      await expect(retention.peek(unrelatedCursor)).resolves.toMatchObject(
-        unrelated,
-      );
-
-      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
-        deleted: 1,
-        completed: 1,
-      });
-      await expect(retention.peek(unrelatedCursor)).resolves.toBeNull();
-    },
-  );
-
-  it("pulls at most one lazy candidate for sweep(1) and never scans or deletes an unrelated row", async () => {
-    const references: Array<{
-      readonly retentionId: string;
-      readonly handleHash: string;
-      readonly expiresAt: string;
-    }> = [];
-    let sourcePulls = 0;
-    let versionedGets = 0;
-    let partitionScans = 0;
-    const deletedIds: string[] = [];
-    const retention: ChallengeRetention = {
-      async track(reference) {
-        references.push(reference);
-        return reference.retentionId;
-      },
-      async *candidates() {
-        for (const reference of references) {
-          sourcePulls += 1;
-          yield {
-            cursor: reference.retentionId,
-            locator: {
-              retentionId: reference.retentionId,
-              handleHash: reference.handleHash,
-            },
-            reference,
-          };
-        }
-      },
-      async complete() {},
-    };
+  it("does not delete a challenge that changed after its scan page", async () => {
     const inner = createMemoryStore();
-    const tracking: Store = {
+    let changeBeforeDelete = true;
+    const racing: Store = {
       collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
         const collection = inner.collection(definition);
         if (definition.name !== "pegma_identity_challenges") {
@@ -1683,92 +1233,45 @@ describe("challenge controls", () => {
         }
         return {
           ...collection,
-          async getVersioned(key) {
-            versionedGets += 1;
-            return collection.getVersioned(key);
-          },
-          async listVersioned(partition) {
-            partitionScans += 1;
-            return collection.listVersioned(partition);
-          },
           async deleteIfUnchanged(key, version) {
-            deletedIds.push(key.id);
+            if (changeBeforeDelete) {
+              changeBeforeDelete = false;
+              const current = await collection.get(key);
+              if (current !== null) {
+                await collection.put({
+                  ...current,
+                  expiresAt: "2026-07-27T12:10:00.000Z",
+                });
+              }
+            }
             return collection.deleteIfUnchanged(key, version);
           },
         };
       },
     };
     let now = "2026-07-27T12:00:00.000Z";
-    const identity = service(tracking, {
-      clock: { now: () => now },
-      challengeRetention: retention,
-    });
-    await identity.beginPasskeyAuthentication("first");
-    await identity.beginPasskeyAuthentication("second");
+    const identity = service(racing, { clock: { now: () => now } });
+    await identity.beginPasskeyAuthentication("request");
     now = "2026-07-27T12:06:00.000Z";
 
-    const result = await identity.sweepChallenges(1);
-
-    expect(sourcePulls).toBe(1);
-    expect(versionedGets).toBe(1);
-    expect(partitionScans).toBe(0);
-    expect(deletedIds).toEqual([references[0]?.handleHash]);
-    expect(deletedIds).not.toContain(references[1]?.handleHash);
-    expect(result).toMatchObject({
+    await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
       pulled: 1,
       inspected: 1,
-      deleted: 1,
-      hasMore: true,
+      deleted: 0,
+      cursor: null,
+      hasMore: false,
     });
+    await expect(
+      inner.collection(challengesCollection).list("challenges"),
+    ).resolves.toHaveLength(1);
   });
 
-  it("closes a lazy retention iterator when the sweep budget is exhausted", async () => {
-    const references: Array<{
-      readonly retentionId: string;
-      readonly handleHash: string;
-      readonly expiresAt: string;
-    }> = [];
-    let finalized = false;
-    const retention: ChallengeRetention = {
-      async track(reference) {
-        references.push(reference);
-        return reference.retentionId;
-      },
-      async *candidates() {
-        try {
-          for (const reference of references) {
-            yield {
-              cursor: reference.retentionId,
-              locator: {
-                retentionId: reference.retentionId,
-                handleHash: reference.handleHash,
-              },
-              reference,
-            };
-          }
-        } finally {
-          finalized = true;
-        }
-      },
-      async complete() {},
-    };
-    let now = "2026-07-27T12:00:00.000Z";
-    const identity = service(createMemoryStore(), {
-      clock: { now: () => now },
-      challengeRetention: retention,
-    });
-    await identity.beginPasskeyAuthentication("first");
-    await identity.beginPasskeyAuthentication("second");
-    now = "2026-07-27T12:06:00.000Z";
-
-    await identity.sweepChallenges(1);
-
-    expect(finalized).toBe(true);
-  });
-
-  it("tracks retention before inserting an authoritative challenge", async () => {
-    let challengeInserts = 0;
+  it("requests and receives at most the caller's bounded page", async () => {
     const inner = createMemoryStore();
+    let scanCalls = 0;
+    let requestedLimit = 0;
+    let returnedRecords = 0;
+    let partitionListings = 0;
     const tracking: Store = {
       collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
         const collection = inner.collection(definition);
@@ -1777,131 +1280,132 @@ describe("challenge controls", () => {
         }
         return {
           ...collection,
-          async insertIfAbsent(value) {
-            challengeInserts += 1;
-            return collection.insertIfAbsent(value);
+          async listVersioned(partition) {
+            partitionListings += 1;
+            return collection.listVersioned(partition);
+          },
+          async scan(options) {
+            scanCalls += 1;
+            requestedLimit = options.limit;
+            const page = await collection.scan(options);
+            returnedRecords = page.records.length;
+            return page;
           },
         };
       },
     };
-    const retention: ChallengeRetention = {
-      async track() {
-        throw new Error("retention unavailable");
-      },
-      async *candidates() {},
-      async complete() {},
-    };
-    const identity = service(tracking, { challengeRetention: retention });
+    const identity = service(tracking);
+    await identity.beginPasskeyAuthentication("first");
+    await identity.beginPasskeyAuthentication("second");
 
-    await expect(
-      identity.beginPasskeyAuthentication("request"),
-    ).rejects.toMatchObject({ code: "invalid_state" });
-    expect(challengeInserts).toBe(0);
-  });
-
-  it("rejects accessor references and safely handles wrong, stale, and duplicate candidates", async () => {
-    const tracked: Array<{
-      readonly retentionId: string;
-      readonly handleHash: string;
-      readonly expiresAt: string;
-    }> = [];
-    let candidates: Array<{
-      readonly cursor: string;
-      readonly locator: ChallengeRetentionLocator;
-      readonly reference: unknown;
-    }> = [];
-    let getters = 0;
-    const retention: ChallengeRetention = {
-      async track(reference) {
-        tracked.push(reference);
-        return reference.retentionId;
-      },
-      async *candidates() {
-        yield* candidates;
-      },
-      async complete() {},
-    };
-    let now = "2026-07-27T12:00:00.000Z";
-    const identity = service(createMemoryStore(), {
-      clock: { now: () => now },
-      challengeRetention: retention,
-    });
-    await identity.beginPasskeyAuthentication("request");
-    const actual = tracked[0];
-    if (actual === undefined) {
-      throw new Error("expected a tracked challenge");
-    }
-    const accessor = Object.create(null, {
-      retentionId: { enumerable: true, value: actual.retentionId },
-      handleHash: {
-        enumerable: true,
-        get() {
-          getters += 1;
-          return actual.handleHash;
-        },
-      },
-      expiresAt: { enumerable: true, value: actual.expiresAt },
-    });
-    candidates = [
-      {
-        cursor: "malformed-accessor",
-        locator: {
-          retentionId: actual.retentionId,
-          handleHash: actual.handleHash,
-        },
-        reference: accessor,
-      },
-      {
-        cursor: actual.retentionId,
-        locator: {
-          retentionId: actual.retentionId,
-          handleHash: actual.handleHash,
-        },
-        reference: {
-          retentionId: actual.retentionId,
-          handleHash: actual.handleHash,
-          expiresAt: "2026-07-27T12:04:00.000Z",
-        },
-      },
-      {
-        cursor: "wrong-reference",
-        locator: {
-          retentionId: "b".repeat(64),
-          handleHash: "a".repeat(64),
-        },
-        reference: {
-          retentionId: "b".repeat(64),
-          handleHash: "a".repeat(64),
-          expiresAt: actual.expiresAt,
-        },
-      },
-      {
-        cursor: actual.retentionId,
-        locator: {
-          retentionId: actual.retentionId,
-          handleHash: actual.handleHash,
-        },
-        reference: actual,
-      },
-      {
-        cursor: actual.retentionId,
-        locator: {
-          retentionId: actual.retentionId,
-          handleHash: actual.handleHash,
-        },
-        reference: actual,
-      },
-    ];
-    now = "2026-07-27T12:06:00.000Z";
-
-    await expect(identity.sweepChallenges(5)).resolves.toMatchObject({
-      pulled: 5,
-      inspected: 5,
-      deleted: 1,
-      rejected: 1,
+    await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
+      pulled: 1,
+      inspected: 1,
       hasMore: true,
     });
+    expect(scanCalls).toBe(1);
+    expect(requestedLimit).toBe(1);
+    expect(returnedRecords).toBe(1);
+    expect(partitionListings).toBe(0);
+  });
+
+  it("rejects accessor-bearing scan pages without executing getters", async () => {
+    const inner = createMemoryStore();
+    let getters = 0;
+    let hostile = false;
+    const wrapped: Store = {
+      collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
+        const collection = inner.collection(definition);
+        if (definition.name !== "pegma_identity_challenges") {
+          return collection;
+        }
+        return {
+          ...collection,
+          async scan(options) {
+            const page = await collection.scan(options);
+            if (!hostile) {
+              return page;
+            }
+            return Object.create(null, {
+              records: {
+                enumerable: true,
+                get() {
+                  getters += 1;
+                  return page.records;
+                },
+              },
+              nextCursor: {
+                enumerable: true,
+                value: page.nextCursor,
+              },
+            }) as typeof page;
+          },
+        };
+      },
+    };
+    const identity = service(wrapped);
+    await identity.beginPasskeyAuthentication("request");
+    hostile = true;
+
+    await expect(identity.sweepChallenges(1)).rejects.toMatchObject({
+      code: "invalid_state",
+    });
     expect(getters).toBe(0);
+  });
+
+  it("retains malformed physical rows without starving later valid rows", async () => {
+    const inner = createMemoryStore();
+    const rawChallenges = defineCollection<StoredRecord>({
+      name: challengesCollection.name,
+      key: (record) => ({
+        partition: String(record.partition),
+        id: String(record.id),
+      }),
+      codec: {
+        encode: (record) => record,
+        decode: (record) => record,
+      },
+    });
+    await inner.collection(rawChallenges).put({
+      partition: "challenges",
+      id: "0".repeat(64),
+      malformed: true,
+    });
+    let now = "2026-07-27T12:00:00.000Z";
+    const identity = service(inner, { clock: { now: () => now } });
+    await identity.beginPasskeyAuthentication("expired");
+    now = "2026-07-27T12:06:00.000Z";
+
+    let cursor: string | undefined;
+    let rejected = 0;
+    let deleted = 0;
+    do {
+      const result = await identity.sweepChallenges(1, cursor);
+      rejected += result.rejected;
+      deleted += result.deleted;
+      cursor = result.cursor ?? undefined;
+      if (!result.hasMore) {
+        break;
+      }
+    } while (true);
+
+    expect(rejected).toBe(1);
+    expect(deleted).toBe(1);
+    await expect(
+      inner
+        .collection(rawChallenges)
+        .get({ partition: "challenges", id: "0".repeat(64) }),
+    ).resolves.not.toBeNull();
+  });
+
+  it("rejects malformed limits and cursors", async () => {
+    const identity = service();
+    await expect(identity.sweepChallenges(0)).rejects.toMatchObject({
+      code: "invalid_input",
+    });
+    await expect(
+      identity.sweepChallenges(1, "not-a-scan-cursor"),
+    ).rejects.toThrow();
   });
 
   it("fails closed when the host rate limiter refuses", async () => {

@@ -51,7 +51,6 @@ export interface ChallengeRecord {
   readonly partition: string;
   readonly id: string;
   readonly handleHash: string;
-  readonly retentionId: string;
   readonly challengeHash: string;
   readonly kind: ChallengeKind;
   readonly state: ChallengeState;
@@ -93,6 +92,7 @@ export interface CredentialIndexRecord {
   readonly credentialHash: string;
   readonly credentialId: string;
   readonly registrationId: string;
+  readonly registrationProofHash: string;
   readonly principalId: string;
   readonly principalHash: string;
   readonly publicKey: string;
@@ -100,6 +100,23 @@ export interface CredentialIndexRecord {
   readonly transports: readonly string[];
   readonly label: string;
   readonly state: CredentialIndexState;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface RegistrationProofRecord {
+  readonly partition: string;
+  readonly id: string;
+  readonly registrationProofHash: string;
+  readonly credentialHash: string;
+  readonly credentialId: string;
+  readonly registrationId: string;
+  readonly principalId: string;
+  readonly principalHash: string;
+  readonly publicKey: string;
+  readonly counter: number;
+  readonly transports: readonly string[];
+  readonly label: string;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -212,7 +229,6 @@ function decodeChallenge(record: StoredRecord): ChallengeRecord {
     partition: storedString(record, "partition", 32),
     id: hash(record, "id"),
     handleHash: hash(record, "handleHash"),
-    retentionId: hash(record, "retentionId"),
     challengeHash: hash(record, "challengeHash"),
     kind: enumValue(record, "kind", ["registration", "authentication"]),
     state: enumValue(record, "state", [
@@ -309,7 +325,7 @@ function passkeyFields(record: StoredRecord) {
 }
 
 function encodePasskeyFields(
-  value: PasskeyRecord | CredentialIndexRecord,
+  value: PasskeyRecord | CredentialIndexRecord | RegistrationProofRecord,
 ): Record<string, string | number> {
   return {
     credentialHash: value.credentialHash,
@@ -373,6 +389,7 @@ function decodeCredentialIndex(record: StoredRecord): CredentialIndexRecord {
     partition: storedString(record, "partition", 96),
     id: hash(record, "id"),
     ...fields,
+    registrationProofHash: hash(record, "registrationProofHash"),
     state: enumValue(record, "state", ["reserved", "active", "revoked"]),
   };
   if (
@@ -396,8 +413,47 @@ export const credentialIndexesCollection =
         partition: value.partition,
         id: value.id,
         ...encodePasskeyFields(value),
+        registrationProofHash: value.registrationProofHash,
         state: value.state,
       }),
       decode: decodeCredentialIndex,
+    },
+  });
+
+function decodeRegistrationProof(
+  record: StoredRecord,
+): RegistrationProofRecord {
+  const fields = passkeyFields(record);
+  const decoded: RegistrationProofRecord = {
+    partition: storedString(record, "partition", 96),
+    id: hash(record, "id"),
+    registrationProofHash: hash(record, "registrationProofHash"),
+    ...fields,
+  };
+  if (
+    decoded.id !== decoded.registrationProofHash ||
+    decoded.partition !==
+      `registration-${decoded.registrationProofHash.slice(0, 16)}`
+  ) {
+    throw new IdentityError(
+      "storage_corrupt",
+      "Stored registration proof identity is malformed.",
+    );
+  }
+  return decoded;
+}
+
+export const registrationProofsCollection =
+  defineCollection<RegistrationProofRecord>({
+    name: "pegma_identity_registration_proofs",
+    key: ({ partition, id }) => ({ partition, id }),
+    codec: {
+      encode: (value) => ({
+        partition: value.partition,
+        id: value.id,
+        registrationProofHash: value.registrationProofHash,
+        ...encodePasskeyFields(value),
+      }),
+      decode: decodeRegistrationProof,
     },
   });

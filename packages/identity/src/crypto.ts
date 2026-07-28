@@ -36,6 +36,10 @@ export async function credentialHash(credentialId: string): Promise<string> {
   return sha256Hex("pegma.identity.credential.v1", credentialId);
 }
 
+export async function registrationProofHash(material: string): Promise<string> {
+  return sha256Hex("pegma.identity.registration-proof.v1", material);
+}
+
 export async function challengeHandleHash(handle: string): Promise<string> {
   return sha256Hex("pegma.identity.challenge-handle.v1", handle);
 }

@@ -4,12 +4,6 @@ import type { Store } from "@pegma/storage-core";
 
 import {
   createChallengeService,
-  createMemoryChallengeRetention,
-  type ChallengeRetentionCandidate,
-  type ChallengeRetentionCursor,
-  type ChallengeRetentionLocator,
-  type ChallengeRetention,
-  type ChallengeRetentionReference,
   type ChallengeSweepResult,
 } from "./challenges.js";
 import { normalizeEmail } from "./email.js";
@@ -42,7 +36,6 @@ export interface IdentityOptions {
   readonly origins: readonly string[];
   readonly registrationLimiter: RateLimiter;
   readonly authenticationLimiter: RateLimiter;
-  readonly challengeRetention: ChallengeRetention;
   readonly clock?: Clock;
   readonly newId?: () => string;
   readonly challengeTtlMs?: number;
@@ -73,7 +66,10 @@ export interface Identity {
     credentialId: string,
   ): Promise<boolean>;
   repairPasskey(credentialId: string): Promise<Passkey | null>;
-  sweepChallenges(limit?: number): Promise<ChallengeSweepResult>;
+  sweepChallenges(
+    limit?: number,
+    cursor?: string,
+  ): Promise<ChallengeSweepResult>;
 }
 
 function positiveBoundedInteger(
@@ -97,7 +93,6 @@ const IDENTITY_OPTION_KEYS = new Set([
   "origins",
   "registrationLimiter",
   "authenticationLimiter",
-  "challengeRetention",
   "clock",
   "newId",
   "challengeTtlMs",
@@ -160,40 +155,6 @@ function validateOrigins(values: unknown): readonly string[] {
   return Object.freeze([...new Set(origins)]);
 }
 
-function retentionMethod(
-  value: object,
-  name: keyof ChallengeRetention,
-): ((...arguments_: unknown[]) => unknown) | null {
-  let current: object | null = value;
-  while (current !== null) {
-    const descriptor = Object.getOwnPropertyDescriptor(current, name);
-    if (descriptor !== undefined) {
-      return "value" in descriptor && typeof descriptor.value === "function"
-        ? (descriptor.value as (...arguments_: unknown[]) => unknown)
-        : null;
-    }
-    current = Object.getPrototypeOf(current) as object | null;
-  }
-  return null;
-}
-
-function validateRetention(value: unknown): ChallengeRetention {
-  if (typeof value !== "object" || value === null) {
-    throw new IdentityError("invalid_input", "Challenge retention is invalid.");
-  }
-  const track = retentionMethod(value, "track");
-  const candidates = retentionMethod(value, "candidates");
-  const complete = retentionMethod(value, "complete");
-  if (track === null || candidates === null || complete === null) {
-    throw new IdentityError("invalid_input", "Challenge retention is invalid.");
-  }
-  return Object.freeze({
-    track: track.bind(value) as ChallengeRetention["track"],
-    candidates: candidates.bind(value) as ChallengeRetention["candidates"],
-    complete: complete.bind(value) as ChallengeRetention["complete"],
-  });
-}
-
 export function createIdentity(options: IdentityOptions): Identity {
   const safe = snapshotOptions(options);
   const issuer = assertBoundedString(safe.issuer, "Issuer", 1_024);
@@ -222,7 +183,6 @@ export function createIdentity(options: IdentityOptions): Identity {
     );
   }
   const origins = validateOrigins(copyDataOnly(safe.origins));
-  const challengeRetention = validateRetention(safe.challengeRetention);
   if (
     !origins.every((origin) => {
       const hostname = new URL(origin).hostname;
@@ -268,7 +228,6 @@ export function createIdentity(options: IdentityOptions): Identity {
     newId,
     ttlMs: challengeTtlMs,
     maxAttempts: challengeMaxAttempts,
-    retention: challengeRetention,
   });
   const passkeys = createPasskeyService({
     store: safe.store as Store,
@@ -300,15 +259,10 @@ export function createIdentity(options: IdentityOptions): Identity {
   });
 }
 
-export { createMemoryChallengeRetention, IdentityError, normalizeEmail };
+export { IdentityError, normalizeEmail };
 export type {
   AuthenticationStart,
   ChallengeSweepResult,
-  ChallengeRetention,
-  ChallengeRetentionCandidate,
-  ChallengeRetentionCursor,
-  ChallengeRetentionLocator,
-  ChallengeRetentionReference,
   FinishAuthenticationInput,
   FinishRegistrationInput,
   IdentityErrorCode,
