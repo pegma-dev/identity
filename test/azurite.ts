@@ -10,6 +10,42 @@ export const TABLE_PORT = 10115;
 let child: ChildProcess | undefined;
 let workspace: string | undefined;
 
+function terminated(process: ChildProcess): boolean {
+  return process.exitCode !== null || process.signalCode !== null;
+}
+
+function waitForTermination(
+  process: ChildProcess,
+  timeoutMilliseconds: number,
+): Promise<boolean> {
+  if (terminated(process)) {
+    return Promise.resolve(true);
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (didTerminate: boolean) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      process.off("exit", onTermination);
+      process.off("close", onTermination);
+      resolve(didTerminate);
+    };
+    const onTermination = () => finish(true);
+    const timer = setTimeout(
+      () => finish(terminated(process)),
+      timeoutMilliseconds,
+    );
+    process.once("exit", onTermination);
+    process.once("close", onTermination);
+    if (terminated(process)) {
+      finish(true);
+    }
+  });
+}
+
 function portAccepting(port: number): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = connect({ host: "127.0.0.1", port });
@@ -40,22 +76,19 @@ async function waitForStartup(
   throw new Error(`Azurite did not start listening on port ${port}.`);
 }
 
-async function stopProcess(instance: ChildProcess): Promise<void> {
-  if (instance.exitCode !== null || instance.signalCode !== null) {
+export async function stopProcess(
+  instance: ChildProcess,
+  gracefulTimeoutMilliseconds = 5_000,
+  forcedTimeoutMilliseconds = 1_000,
+): Promise<void> {
+  if (terminated(instance)) {
     return;
   }
-  await new Promise<void>((resolve) => {
-    const settle = () => {
-      instance.off("error", settle);
-      instance.off("exit", settle);
-      resolve();
-    };
-    instance.once("error", settle);
-    instance.once("exit", settle);
-    if (!instance.kill()) {
-      settle();
-    }
-  });
+  instance.kill();
+  if (!(await waitForTermination(instance, gracefulTimeoutMilliseconds))) {
+    instance.kill("SIGKILL");
+    await waitForTermination(instance, forcedTimeoutMilliseconds);
+  }
 }
 
 export async function setup(): Promise<void> {
@@ -90,12 +123,19 @@ export async function setup(): Promise<void> {
 }
 
 export async function teardown(): Promise<void> {
-  if (child !== undefined) {
-    await stopProcess(child);
-  }
+  const running = child;
   child = undefined;
-  if (workspace !== undefined) {
-    await rm(workspace, { force: true, recursive: true });
-    workspace = undefined;
+  if (running !== undefined) {
+    await stopProcess(running);
+  }
+  const directory = workspace;
+  workspace = undefined;
+  if (directory !== undefined) {
+    await rm(directory, {
+      force: true,
+      recursive: true,
+      maxRetries: 5,
+      retryDelay: 100,
+    });
   }
 }

@@ -25,7 +25,11 @@ import {
   type User,
   type VerifiedIdentityClaims,
 } from "./users.js";
-import { assertBoundedString, copyDataOnly } from "./validation.js";
+import {
+  assertBoundedString,
+  copyDataOnly,
+  isLocalDevelopmentHostname,
+} from "./validation.js";
 
 export interface IdentityOptions {
   readonly store: Store;
@@ -136,10 +140,7 @@ function validateOrigins(values: unknown): readonly string[] {
     } catch (cause) {
       throw new IdentityError("invalid_input", "Origin is invalid.", { cause });
     }
-    const local =
-      url.hostname === "localhost" ||
-      url.hostname === "127.0.0.1" ||
-      url.hostname === "[::1]";
+    const local = isLocalDevelopmentHostname(url.hostname);
     if (
       url.origin !== input ||
       (url.protocol !== "https:" && !(local && url.protocol === "http:")) ||

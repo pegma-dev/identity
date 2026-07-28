@@ -342,6 +342,12 @@ export function dataField(value: unknown, field: string): unknown {
   return descriptor.value;
 }
 
+export function isLocalDevelopmentHostname(hostname: string): boolean {
+  return (
+    hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]"
+  );
+}
+
 function isWellFormedUnicode(value: string): boolean {
   return typeof value.isWellFormed === "function"
     ? value.isWellFormed()
