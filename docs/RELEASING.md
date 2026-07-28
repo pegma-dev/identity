@@ -9,7 +9,10 @@ a protected signed annotated tag already on `origin/main`.
 The release tool verifies the single public workspace, stable package version,
 exact runtime pins, matching lockfile, package metadata, package-local README
 and LICENSE, prepack build, test exclusion, dist-only allowlist, exports, and a
-production dependency audit. Packing builds once, checks the complete file
+production dependency audit. Every direct runtime lock entry must carry an
+exact public-registry URL and SHA-512 integrity. Release commands discard
+inherited npm configuration, use isolated temporary config files, and pass the
+public registry explicitly. Packing builds once, checks the complete file
 inventory and hashes, and imports the package from a clean consumer
 installation.
 
@@ -32,7 +35,7 @@ and the reviewed npm version:
 git fetch origin
 git switch --detach origin/main
 npm install --global npm@11.18.0
-npm ci
+npm ci --registry https://registry.npmjs.org/
 npm run format:check
 npm run check
 npm test
@@ -67,7 +70,7 @@ npm operator with current interactive requirements and publish only the
 reviewed tarball under `bootstrap`:
 
 ```sh
-npm publish .release/pegma-identity-0.0.0.tgz --access public --tag bootstrap
+npm publish .release/pegma-identity-0.0.0.tgz --access public --tag bootstrap --registry https://registry.npmjs.org/
 npm run release:registry:check -- -- --manifest .release/package-manifest.json
 npm dist-tag ls @pegma/identity
 ```
@@ -103,6 +106,13 @@ git fetch origin tag v0.1.0 --force
 git verify-tag v0.1.0
 gh release create v0.1.0 --verify-tag --title "v0.1.0"
 ```
+
+The workflow rejects prerelease events, tag/version mismatches, and every
+normal package version below `0.1.0` immediately after checkout, before
+fetching the protected branch or installing anything. CI and preparation use
+an isolated npm user config plus an explicit public-registry override; the
+release tool repeats that isolation for audit, clean-consumer install,
+registry comparison, and publish.
 
 The unprivileged preparation job verifies the signed tag, release-event
 commit, main ancestry, full gate, production audit, package inventory,

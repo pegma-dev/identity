@@ -22,7 +22,7 @@
     "release:pack": "node scripts/release-package.mjs pack",
     "release:publish": "node scripts/release-package.mjs publish",
     "release:registry:check": "node scripts/release-package.mjs registry-check",
-    "test": "npm run build && vitest run"
+    "test": "npm run build && node --test scripts/*.test.mjs && vitest run"
   },
   "devDependencies": {
     "@azure/data-tables": "13.3.1",

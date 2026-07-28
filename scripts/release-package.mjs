@@ -18,6 +18,7 @@ const PACKAGE_DIRECTORY = "packages/identity";
 const REPOSITORY_URL = "git+https://github.com/pegma-dev/identity.git";
 const PACKAGE_MANAGER = "npm@11.18.0";
 const NODE_RANGE = ">=22";
+const PUBLIC_REGISTRY = "https://registry.npmjs.org/";
 const REQUIRED_DEPENDENCIES = {
   "@pegma/rate-limit": "0.1.0",
   "@pegma/spine": "0.1.1",
@@ -38,7 +39,7 @@ function run(command, arguments_, options = {}) {
   const result = spawnSync(command, arguments_, {
     cwd: options.cwd,
     encoding: "utf8",
-    env: process.env,
+    env: options.env ?? process.env,
     shell: options.shell ?? false,
     stdio: options.capture ? "pipe" : "inherit",
   });
@@ -84,6 +85,52 @@ function directDependencyLockEntry(lock, name, version) {
     lock.packages?.[`node_modules/${name}`],
   ];
   return candidates.find((entry) => entry?.version === version);
+}
+
+export function isolatedPublicNpmEnvironment(
+  environment,
+  userConfig,
+  globalConfig,
+) {
+  const isolated = {};
+  for (const [name, value] of Object.entries(environment)) {
+    if (!name.toLowerCase().startsWith("npm_config_")) {
+      isolated[name] = value;
+    }
+  }
+  isolated.NPM_CONFIG_REGISTRY = PUBLIC_REGISTRY;
+  isolated.NPM_CONFIG_USERCONFIG = userConfig;
+  isolated.NPM_CONFIG_GLOBALCONFIG = globalConfig;
+  return isolated;
+}
+
+async function publicNpmConfiguration() {
+  const directory = await mkdtemp(join(tmpdir(), "pegma-identity-npm-"));
+  const userConfig = join(directory, "user.npmrc");
+  const globalConfig = join(directory, "global.npmrc");
+  await writeFile(userConfig, `registry=${PUBLIC_REGISTRY}\n`);
+  await writeFile(globalConfig, "");
+  return {
+    environment: isolatedPublicNpmEnvironment(
+      process.env,
+      userConfig,
+      globalConfig,
+    ),
+    async dispose() {
+      await rm(directory, { force: true, recursive: true });
+    },
+  };
+}
+
+function publicRegistryArguments(arguments_) {
+  return [...arguments_, "--registry", PUBLIC_REGISTRY];
+}
+
+export function assertNormalReleaseVersion(version) {
+  const match = /^(\d+)\.(\d+)\.(\d+)$/u.exec(version);
+  if (match === null || (Number(match[1]) === 0 && Number(match[2]) === 0)) {
+    fail("normal releases require a stable package version of at least 0.1.0");
+  }
 }
 
 function safeEqual(left, right) {
@@ -280,16 +327,25 @@ function validatePackedFiles(files) {
   }
 }
 
-async function smokeImport(tarball) {
+async function smokeImport(tarball, npmEnvironment) {
   const workspace = await mkdtemp(join(tmpdir(), "pegma-identity-consumer-"));
   try {
     await writeFile(
       join(workspace, "package.json"),
       JSON.stringify({ private: true, type: "module" }),
     );
-    runNpm(["install", "--ignore-scripts", "--no-audit", tarball], {
-      cwd: workspace,
-    });
+    runNpm(
+      publicRegistryArguments([
+        "install",
+        "--ignore-scripts",
+        "--no-audit",
+        tarball,
+      ]),
+      {
+        cwd: workspace,
+        env: npmEnvironment,
+      },
+    );
     run(
       process.execPath,
       [
@@ -317,57 +373,78 @@ async function pack(root, arguments_) {
       `release tag ${source.tag} does not match package version ${manifest.version}`,
     );
   }
-  runNpm(["audit", "--omit=dev", "--audit-level=high"], { cwd: root });
-  const output = resolve(
-    root,
-    valueAfter(arguments_, "--output") ?? ".release",
-  );
-  if (
-    output !== root &&
-    !output.startsWith(`${root}\\`) &&
-    !output.startsWith(`${root}/`)
-  ) {
-    fail("release output must remain inside the repository");
+  const npmConfiguration = await publicNpmConfiguration();
+  try {
+    runNpm(
+      publicRegistryArguments(["audit", "--omit=dev", "--audit-level=high"]),
+      {
+        cwd: root,
+        env: npmConfiguration.environment,
+      },
+    );
+    const output = resolve(
+      root,
+      valueAfter(arguments_, "--output") ?? ".release",
+    );
+    if (
+      output !== root &&
+      !output.startsWith(`${root}\\`) &&
+      !output.startsWith(`${root}/`)
+    ) {
+      fail("release output must remain inside the repository");
+    }
+    await mkdir(output, { recursive: true });
+    if ((await readdir(output)).length !== 0) {
+      fail(`release output ${output} must be empty`);
+    }
+    const packed = runNpm(
+      publicRegistryArguments([
+        "pack",
+        `./${PACKAGE_DIRECTORY}`,
+        "--json",
+        "--pack-destination",
+        output,
+      ]),
+      {
+        cwd: root,
+        capture: true,
+        env: npmConfiguration.environment,
+      },
+    );
+    const entries = JSON.parse(packed.stdout);
+    if (!Array.isArray(entries) || entries.length !== 1) {
+      fail("npm pack did not report exactly one package");
+    }
+    const entry = entries[0];
+    const files = entry.files.map(({ path }) => path).sort();
+    validatePackedFiles(files);
+    const tarball = join(output, basename(entry.filename));
+    const bytes = await readFile(tarball);
+    const digest = hashes(bytes);
+    if (
+      !safeEqual(digest.integrity, entry.integrity) ||
+      !safeEqual(digest.shasum, entry.shasum)
+    ) {
+      fail("local tarball hashes disagree with npm pack");
+    }
+    await smokeImport(tarball, npmConfiguration.environment);
+    const receipt = {
+      package: PACKAGE_NAME,
+      version: manifest.version,
+      gitCommit: source.commit,
+      releaseTag: source.tag,
+      tarball: basename(tarball),
+      ...digest,
+      files,
+    };
+    await writeFile(
+      join(output, "package-manifest.json"),
+      `${JSON.stringify(receipt, null, 2)}\n`,
+    );
+    console.log(`Prepared ${PACKAGE_NAME}@${manifest.version} at ${tarball}`);
+  } finally {
+    await npmConfiguration.dispose();
   }
-  await mkdir(output, { recursive: true });
-  if ((await readdir(output)).length !== 0) {
-    fail(`release output ${output} must be empty`);
-  }
-  const packed = runNpm(
-    ["pack", `./${PACKAGE_DIRECTORY}`, "--json", "--pack-destination", output],
-    { cwd: root, capture: true },
-  );
-  const entries = JSON.parse(packed.stdout);
-  if (!Array.isArray(entries) || entries.length !== 1) {
-    fail("npm pack did not report exactly one package");
-  }
-  const entry = entries[0];
-  const files = entry.files.map(({ path }) => path).sort();
-  validatePackedFiles(files);
-  const tarball = join(output, basename(entry.filename));
-  const bytes = await readFile(tarball);
-  const digest = hashes(bytes);
-  if (
-    !safeEqual(digest.integrity, entry.integrity) ||
-    !safeEqual(digest.shasum, entry.shasum)
-  ) {
-    fail("local tarball hashes disagree with npm pack");
-  }
-  await smokeImport(tarball);
-  const receipt = {
-    package: PACKAGE_NAME,
-    version: manifest.version,
-    gitCommit: source.commit,
-    releaseTag: source.tag,
-    tarball: basename(tarball),
-    ...digest,
-    files,
-  };
-  await writeFile(
-    join(output, "package-manifest.json"),
-    `${JSON.stringify(receipt, null, 2)}\n`,
-  );
-  console.log(`Prepared ${PACKAGE_NAME}@${manifest.version} at ${tarball}`);
 }
 
 async function readAndVerifyReceipt(root, arguments_) {
@@ -402,15 +479,26 @@ async function readAndVerifyReceipt(root, arguments_) {
 
 async function registryCheck(root, arguments_) {
   const { receipt } = await readAndVerifyReceipt(root, arguments_);
-  const result = runNpm(
-    [
-      "view",
-      `${receipt.package}@${receipt.version}`,
-      "dist.integrity",
-      "--json",
-    ],
-    { cwd: root, capture: true, allowFailure: true },
-  );
+  const npmConfiguration = await publicNpmConfiguration();
+  let result;
+  try {
+    result = runNpm(
+      publicRegistryArguments([
+        "view",
+        `${receipt.package}@${receipt.version}`,
+        "dist.integrity",
+        "--json",
+      ]),
+      {
+        cwd: root,
+        capture: true,
+        allowFailure: true,
+        env: npmConfiguration.environment,
+      },
+    );
+  } finally {
+    await npmConfiguration.dispose();
+  }
   if (result.status !== 0) {
     if (/\bE404\b/u.test(`${result.stdout}\n${result.stderr}`)) {
       console.log(`${receipt.package}@${receipt.version}: absent`);
@@ -427,12 +515,38 @@ async function registryCheck(root, arguments_) {
 
 async function publish(root, arguments_) {
   const { receipt, tarball } = await readAndVerifyReceipt(root, arguments_);
-  if (receipt.version === "0.0.0") {
-    fail("the trusted-publisher workflow refuses the manual bootstrap version");
+  assertNormalReleaseVersion(receipt.version);
+  const npmConfiguration = await publicNpmConfiguration();
+  try {
+    runNpm(
+      publicRegistryArguments([
+        "publish",
+        tarball,
+        "--access",
+        "public",
+        "--provenance",
+      ]),
+      {
+        cwd: root,
+        env: npmConfiguration.environment,
+      },
+    );
+  } finally {
+    await npmConfiguration.dispose();
   }
-  runNpm(["publish", tarball, "--access", "public", "--provenance"], {
-    cwd: root,
-  });
+}
+
+async function normalReleaseCheck(root, arguments_) {
+  const { manifest } = await validateRepository(root);
+  assertNormalReleaseVersion(manifest.version);
+  const source = assertGitRequirements(root, arguments_);
+  if (
+    process.env.RELEASE_PRERELEASE !== "false" ||
+    process.env.RELEASE_TAG !== `v${manifest.version}`
+  ) {
+    fail("the release event does not match the stable package version");
+  }
+  return source;
 }
 
 async function main() {
@@ -453,9 +567,20 @@ async function main() {
     case "registry-check":
       await registryCheck(root, arguments_);
       break;
+    case "normal-release-check":
+      await normalReleaseCheck(root, arguments_);
+      console.log("Normal release metadata is valid.");
+      break;
     default:
-      fail("expected check, pack, publish, or registry-check");
+      fail(
+        "expected check, pack, publish, registry-check, or normal-release-check",
+      );
   }
 }
 
-await main();
+if (
+  process.argv[1] !== undefined &&
+  resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+) {
+  await main();
+}
