@@ -1,4 +1,4 @@
-import type { RateLimiter } from "@pegma/rate-limit";
+import type { DurableRateLimiter, RateLimiter } from "@pegma/rate-limit";
 import { systemClock, type Clock, type PrincipalId } from "@pegma/spine";
 import type { Store } from "@pegma/storage-core";
 
@@ -6,7 +6,16 @@ import {
   createChallengeService,
   type ChallengeSweepResult,
 } from "./challenges.js";
-import { normalizeEmail } from "./email.js";
+import type { EmailCodeProtector } from "./crypto.js";
+import {
+  createEmailCodeService,
+  type EmailCodeStart,
+  type EmailOperationSweepResult,
+  type FinishEmailChangeInput,
+  type FinishEmailCodeInput,
+  type IdentityMailRenderer,
+  type IdentityMailContent,
+} from "./email-codes.js";
 import { IdentityError, type IdentityErrorCode } from "./errors.js";
 import {
   createPasskeyService,
@@ -16,6 +25,18 @@ import {
   type Passkey,
   type RegistrationStart,
 } from "./passkeys.js";
+import {
+  createIdentityMailService,
+  type AcknowledgeTerminalMail,
+  type AuthenticatedMailCallback,
+  type IdentityMailWorkerOptions,
+  type MailPageOptions,
+  type MailProvider,
+  type MailReconciliationPort,
+  type MailWorker,
+  type SweepTerminalMailOptions,
+  type SweepTerminalMailResult,
+} from "./identity-mail.js";
 import {
   createUserService,
   type ProvisionVerifiedUserInput,
@@ -36,11 +57,17 @@ export interface IdentityOptions {
   readonly origins: readonly string[];
   readonly registrationLimiter: RateLimiter;
   readonly authenticationLimiter: RateLimiter;
+  readonly emailCodeProtector: EmailCodeProtector;
+  readonly emailCodeRequestLimiter: DurableRateLimiter;
+  readonly emailCodeVerificationLimiter: DurableRateLimiter;
   readonly clock?: Clock;
   readonly newId?: () => string;
   readonly challengeTtlMs?: number;
   readonly challengeMaxAttempts?: number;
   readonly repairDelayMs?: number;
+  readonly emailCodeTtlMs?: number;
+  readonly emailCodeMaxAttempts?: number;
+  readonly emailOperationRetentionMs?: number;
 }
 
 export interface Identity {
@@ -70,6 +97,46 @@ export interface Identity {
     limit?: number,
     cursor?: string,
   ): Promise<ChallengeSweepResult>;
+  beginAccountCreation(
+    email: string,
+    rateLimitKey: string,
+  ): Promise<EmailCodeStart>;
+  finishAccountCreation(
+    input: FinishEmailCodeInput,
+  ): Promise<VerifiedIdentityClaims>;
+  beginEmailSignIn(
+    email: string,
+    rateLimitKey: string,
+  ): Promise<EmailCodeStart>;
+  finishEmailSignIn(
+    input: FinishEmailCodeInput,
+  ): Promise<VerifiedIdentityClaims>;
+  beginRecovery(email: string, rateLimitKey: string): Promise<EmailCodeStart>;
+  finishRecovery(input: FinishEmailCodeInput): Promise<VerifiedIdentityClaims>;
+  beginEmailChange(
+    principalId: PrincipalId,
+    newEmail: string,
+    rateLimitKey: string,
+  ): Promise<EmailCodeStart>;
+  finishEmailChange(input: FinishEmailChangeInput): Promise<User>;
+  createMailWorker(options: IdentityMailWorkerOptions): MailWorker;
+  applyAuthenticatedMailCallback(
+    callback: AuthenticatedMailCallback,
+  ): ReturnType<
+    ReturnType<typeof createIdentityMailService>["applyAuthenticatedCallback"]
+  >;
+  acknowledgeTerminalMail(
+    acknowledgement: AcknowledgeTerminalMail,
+  ): ReturnType<
+    ReturnType<typeof createIdentityMailService>["acknowledgeTerminal"]
+  >;
+  sweepMail(
+    options: SweepTerminalMailOptions,
+  ): Promise<SweepTerminalMailResult>;
+  sweepEmailOperations(
+    limit?: number,
+    cursor?: string,
+  ): Promise<EmailOperationSweepResult>;
 }
 
 function positiveBoundedInteger(
@@ -93,11 +160,17 @@ const IDENTITY_OPTION_KEYS = new Set([
   "origins",
   "registrationLimiter",
   "authenticationLimiter",
+  "emailCodeProtector",
+  "emailCodeRequestLimiter",
+  "emailCodeVerificationLimiter",
   "clock",
   "newId",
   "challengeTtlMs",
   "challengeMaxAttempts",
   "repairDelayMs",
+  "emailCodeTtlMs",
+  "emailCodeMaxAttempts",
+  "emailOperationRetentionMs",
 ]);
 
 function snapshotOptions(value: unknown): Record<string, unknown> {
@@ -153,6 +226,26 @@ function validateOrigins(values: unknown): readonly string[] {
     return url.origin;
   });
   return Object.freeze([...new Set(origins)]);
+}
+
+function hasDataMethods(value: unknown, names: readonly string[]): boolean {
+  if (
+    (typeof value !== "object" && typeof value !== "function") ||
+    value === null
+  ) {
+    return false;
+  }
+  return names.every((name) => {
+    let current: object | null = value;
+    for (let depth = 0; current !== null && depth < 8; depth += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(current, name);
+      if (descriptor !== undefined) {
+        return "value" in descriptor && typeof descriptor.value === "function";
+      }
+      current = Object.getPrototypeOf(current);
+    }
+    return false;
+  });
 }
 
 export function createIdentity(options: IdentityOptions): Identity {
@@ -215,6 +308,38 @@ export function createIdentity(options: IdentityOptions): Identity {
     24 * 60 * 60_000,
     "Repair delay",
   );
+  const emailCodeTtlMs = positiveBoundedInteger(
+    safe.emailCodeTtlMs as number | undefined,
+    10 * 60_000,
+    15 * 60_000,
+    "Email-code TTL",
+  );
+  const emailCodeMaxAttempts = positiveBoundedInteger(
+    safe.emailCodeMaxAttempts as number | undefined,
+    5,
+    10,
+    "Email-code attempt limit",
+  );
+  const emailOperationRetentionMs = positiveBoundedInteger(
+    safe.emailOperationRetentionMs as number | undefined,
+    7 * 24 * 60 * 60_000,
+    90 * 24 * 60 * 60_000,
+    "Email operation retention",
+  );
+  if (
+    !hasDataMethods(safe.emailCodeProtector, [
+      "deriveCode",
+      "verifier",
+      "matches",
+    ]) ||
+    !hasDataMethods(safe.emailCodeRequestLimiter, ["allow", "sweep"]) ||
+    !hasDataMethods(safe.emailCodeVerificationLimiter, ["allow", "sweep"])
+  ) {
+    throw new IdentityError(
+      "invalid_input",
+      "Email-code security options are invalid.",
+    );
+  }
   const users = createUserService({
     store: safe.store as Store,
     clock,
@@ -241,6 +366,24 @@ export function createIdentity(options: IdentityOptions): Identity {
     users,
     newId,
   });
+  const emailCodes = createEmailCodeService({
+    store: safe.store as Store,
+    clock,
+    newId,
+    users,
+    protector: safe.emailCodeProtector as EmailCodeProtector,
+    requestLimiter: safe.emailCodeRequestLimiter as DurableRateLimiter,
+    verificationLimiter:
+      safe.emailCodeVerificationLimiter as DurableRateLimiter,
+    ttlMs: emailCodeTtlMs,
+    maxAttempts: emailCodeMaxAttempts,
+    retentionMs: emailOperationRetentionMs,
+  });
+  const mail = createIdentityMailService({
+    store: safe.store as Store,
+    clock,
+    emailCodes,
+  });
 
   return Object.freeze({
     provisionVerifiedUser: users.provisionVerifiedUser,
@@ -256,10 +399,25 @@ export function createIdentity(options: IdentityOptions): Identity {
     removePasskey: passkeys.removePasskey,
     repairPasskey: passkeys.repairPasskey,
     sweepChallenges: challenges.sweep,
+    beginAccountCreation: emailCodes.beginAccountCreation,
+    finishAccountCreation: emailCodes.finishAccountCreation,
+    beginEmailSignIn: emailCodes.beginEmailSignIn,
+    finishEmailSignIn: emailCodes.finishEmailSignIn,
+    beginRecovery: emailCodes.beginRecovery,
+    finishRecovery: emailCodes.finishRecovery,
+    beginEmailChange: emailCodes.beginEmailChange,
+    finishEmailChange: emailCodes.finishEmailChange,
+    createMailWorker: mail.createWorker,
+    applyAuthenticatedMailCallback: mail.applyAuthenticatedCallback,
+    acknowledgeTerminalMail: mail.acknowledgeTerminal,
+    sweepMail: mail.sweep,
+    sweepEmailOperations: emailCodes.sweep,
   });
 }
 
-export { IdentityError, normalizeEmail };
+export { createHmacEmailCodeProtector } from "./crypto.js";
+export { IdentityError } from "./errors.js";
+export { normalizeEmail } from "./email.js";
 export type {
   AuthenticationStart,
   ChallengeSweepResult,
@@ -271,4 +429,20 @@ export type {
   RegistrationStart,
   User,
   VerifiedIdentityClaims,
+  EmailCodeProtector,
+  EmailCodeStart,
+  EmailOperationSweepResult,
+  FinishEmailChangeInput,
+  FinishEmailCodeInput,
+  IdentityMailRenderer,
+  IdentityMailContent,
+  IdentityMailWorkerOptions,
+  AcknowledgeTerminalMail,
+  AuthenticatedMailCallback,
+  MailWorker,
+  MailPageOptions,
+  MailProvider,
+  MailReconciliationPort,
+  SweepTerminalMailOptions,
+  SweepTerminalMailResult,
 };

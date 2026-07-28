@@ -12,7 +12,12 @@ import {
 import { describe, expect, it } from "vitest";
 
 import { TABLE_PORT } from "../../../test/azurite.js";
-import { createIdentity, IdentityError, normalizeEmail } from "./index.js";
+import {
+  createHmacEmailCodeProtector,
+  createIdentity,
+  IdentityError,
+  normalizeEmail,
+} from "./index.js";
 import { emailHash, principalHash } from "./crypto.js";
 import {
   challengesCollection,
@@ -29,6 +34,12 @@ const CONNECTION_STRING =
 const allow = {
   async allow() {
     return { allowed: true as const };
+  },
+};
+const durableAllow = {
+  ...allow,
+  async sweep() {
+    return { scanned: 0, deleted: 0 };
   },
 };
 
@@ -49,6 +60,11 @@ function identity(store: Store, newId = () => randomUUID()) {
     origins: ["https://example.test"],
     registrationLimiter: allow,
     authenticationLimiter: allow,
+    emailCodeProtector: createHmacEmailCodeProtector(
+      new Uint8Array(32).fill(7),
+    ),
+    emailCodeRequestLimiter: durableAllow,
+    emailCodeVerificationLimiter: durableAllow,
     clock: fixedClock("2026-07-27T12:00:00.000Z"),
     newId,
   });
@@ -206,6 +222,42 @@ describe.each([
       issuer: "https://issuer.example",
       subject: principalId,
       emailVerified: true,
+    });
+  });
+
+  it("fails closed when an active email index does not match its User", async () => {
+    const store = makeStore();
+    const service = identity(store);
+    const principalId = "principal-stale-index" as PrincipalId;
+    await service.provisionVerifiedUser({
+      principalId,
+      email: "current@example.test",
+    });
+    const [ownerHash, staleEmailHash] = await Promise.all([
+      principalHash(principalId),
+      emailHash("stale@example.test"),
+    ]);
+    await store.collection(emailIndexesCollection).put({
+      partition: `email-${staleEmailHash.slice(0, 16)}`,
+      id: staleEmailHash,
+      email: "stale@example.test",
+      emailHash: staleEmailHash,
+      principalId,
+      principalHash: ownerHash,
+      operationId: "poisoned-active-index",
+      state: "active",
+      createdAt: "2026-07-27T12:00:00.000Z",
+      updatedAt: "2026-07-27T12:00:00.000Z",
+      repairAfter: "2026-07-27T12:01:00.000Z",
+      changeOperationHash: null,
+      replacementEmailHash: null,
+    });
+
+    await expect(
+      service.findUserByEmail("stale@example.test"),
+    ).rejects.toMatchObject({
+      code: "storage_corrupt",
+      message: "Active email index does not match its user.",
     });
   });
 

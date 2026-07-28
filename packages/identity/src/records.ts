@@ -26,9 +26,16 @@ export interface UserRecord {
   readonly emailVerified: boolean;
   readonly createdAt: string;
   readonly updatedAt: string;
+  readonly emailChangeOperationHash: string | null;
 }
 
-export type EmailIndexState = "reserved" | "prepared" | "committed" | "active";
+export type EmailIndexState =
+  | "reserved"
+  | "prepared"
+  | "committed"
+  | "active"
+  | "change_reserved"
+  | "retiring";
 
 export interface EmailIndexRecord {
   readonly partition: string;
@@ -42,6 +49,8 @@ export interface EmailIndexRecord {
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly repairAfter: string;
+  readonly changeOperationHash: string | null;
+  readonly replacementEmailHash: string | null;
 }
 
 export type ChallengeKind = "registration" | "authentication";
@@ -158,11 +167,18 @@ function decodeUser(record: StoredRecord): UserRecord {
     emailVerified: storedBoolean(record, "emailVerified"),
     createdAt: timestamp(record, "createdAt"),
     updatedAt: timestamp(record, "updatedAt"),
+    emailChangeOperationHash: storedNullableString(
+      record,
+      "emailChangeOperationHash",
+      64,
+    ),
   };
   if (
     decoded.id !== decoded.principalHash ||
     decoded.partition !== `principal-${decoded.principalHash.slice(0, 16)}` ||
-    decoded.emailVerified !== (decoded.status === "active")
+    decoded.emailVerified !== (decoded.status === "active") ||
+    (decoded.emailChangeOperationHash !== null &&
+      !/^[0-9a-f]{64}$/u.test(decoded.emailChangeOperationHash))
   ) {
     throw new IdentityError(
       "storage_corrupt",
@@ -195,14 +211,33 @@ function decodeEmailIndex(record: StoredRecord): EmailIndexRecord {
       "prepared",
       "committed",
       "active",
+      "change_reserved",
+      "retiring",
     ]),
     createdAt: timestamp(record, "createdAt"),
     updatedAt: timestamp(record, "updatedAt"),
     repairAfter: timestamp(record, "repairAfter"),
+    changeOperationHash: storedNullableString(
+      record,
+      "changeOperationHash",
+      64,
+    ),
+    replacementEmailHash: storedNullableString(
+      record,
+      "replacementEmailHash",
+      64,
+    ),
   };
   if (
     decoded.id !== decoded.emailHash ||
-    decoded.partition !== `email-${decoded.emailHash.slice(0, 16)}`
+    decoded.partition !== `email-${decoded.emailHash.slice(0, 16)}` ||
+    (decoded.changeOperationHash !== null &&
+      !/^[0-9a-f]{64}$/u.test(decoded.changeOperationHash)) ||
+    (decoded.replacementEmailHash !== null &&
+      !/^[0-9a-f]{64}$/u.test(decoded.replacementEmailHash)) ||
+    (decoded.state === "change_reserved" || decoded.state === "retiring") !==
+      (decoded.changeOperationHash !== null) ||
+    (decoded.state === "retiring") !== (decoded.replacementEmailHash !== null)
   ) {
     throw new IdentityError(
       "storage_corrupt",

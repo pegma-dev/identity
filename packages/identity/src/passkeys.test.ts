@@ -13,6 +13,7 @@ import {
   type StoredRecord,
 } from "@pegma/storage-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createHmacEmailCodeProtector } from "./crypto.js";
 
 const ceremony = vi.hoisted(() => ({
   registrationChallenge: "registration_challenge",
@@ -127,6 +128,12 @@ const CONNECTION_STRING =
 const allow = {
   async allow() {
     return { allowed: true as const };
+  },
+};
+const durableAllow = {
+  ...allow,
+  async sweep() {
+    return { scanned: 0, deleted: 0 };
   },
 };
 
@@ -259,6 +266,11 @@ function service(
     origins: ["https://example.test"],
     registrationLimiter: allow,
     authenticationLimiter: options.authenticationLimiter ?? allow,
+    emailCodeProtector: createHmacEmailCodeProtector(
+      new Uint8Array(32).fill(7),
+    ),
+    emailCodeRequestLimiter: durableAllow,
+    emailCodeVerificationLimiter: durableAllow,
     newId: options.newId ?? (() => randomUUID()),
     ...(options.clock === undefined ? {} : { clock: options.clock }),
   });

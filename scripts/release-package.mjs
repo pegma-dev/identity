@@ -20,6 +20,7 @@ const PACKAGE_MANAGER = "npm@11.18.0";
 const NODE_RANGE = ">=22";
 const PUBLIC_REGISTRY = "https://registry.npmjs.org/";
 const REQUIRED_DEPENDENCIES = {
+  "@pegma/mail": "0.1.0",
   "@pegma/rate-limit": "0.1.0",
   "@pegma/spine": "0.1.1",
   "@pegma/storage-core": "0.4.0",
