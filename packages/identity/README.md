@@ -3,9 +3,9 @@
 Passkeys-first, passwordless first-party identity for Pegma hosts.
 
 > [!IMPORTANT]
-> This package is an audited `0.0.0` name-reservation candidate. It is not an
-> advertised production release. The user/email-index, durable email-code,
-> and WebAuthn foundations are implemented.
+> The audited `0.0.0` package was published only to reserve the npm name.
+> Version `0.1.0` is the first advertised stable release of the implemented
+> user/email-index, durable email-code, and WebAuthn foundations.
 
 ## What it owns
 

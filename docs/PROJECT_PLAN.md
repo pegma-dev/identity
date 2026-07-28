@@ -2,7 +2,10 @@
 
 ## Status
 
-**Stage:** full passwordless lifecycle implemented (`0.0.0`, unpublished).
+**Stage:** first advertised stable release candidate (`0.1.0`).
+The audited `0.0.0` name-reservation bootstrap is published and deliberately
+unadvertised. Version `0.1.0` contains the reviewed full passwordless
+lifecycle; it remains unpublished until the protected release ceremony.
 The user/email-index model, durable email-code creation/fallback/recovery and
 email-change lifecycle, and passkey/challenge foundation are built and tested
 over memory plus real Azurite races. Mail delivery uses exact
@@ -201,18 +204,22 @@ Registration and authentication ceremonies, credential management,
 counter handling. Exit: a host can run passkey-only sign-in with email
 strictly as enrollment/recovery.
 
-### Phase 4 — threat model, review, first consumer (threat model implemented)
+### Phase 4 — threat model, review, first consumer (release gate implemented)
 
-THREAT_MODEL.md, an adversarial security pass, and a real consumer wired
-end-to-end (candidate: the pegma.dev Workers slice, or a demo host; the
-reference application stays on Auth0 until it has a reason not to be).
-First publish follows the ecosystem bootstrap rule (npm/cli#8544).
+THREAT_MODEL.md and repeated adversarial review passes gate the release. The
+audited `0.0.0` package-name bootstrap followed the ecosystem bootstrap rule
+(npm/cli#8544). The first advertised `0.1.0` release is prepared from the
+reviewed implementation without runtime or API changes. A real consumer wired
+end-to-end remains follow-up integration work rather than a reason to weaken
+the package boundary.
 
 ## Timing
 
-The storage, rate-limit, WebAuthn, and Mail prerequisites now exist. Phases 1,
-2, and 3 are implemented. The remaining work before an advertised release is
-the Phase 4 adversarial review and first-consumer integration.
+The storage, rate-limit, WebAuthn, and Mail prerequisites exist. Phases 1, 2,
+and 3 are implemented, the threat model and adversarial release review are
+complete, and the audited `0.0.0` bootstrap is published. The remaining step
+for the first advertised release is the protected `v0.1.0` release ceremony.
+First-consumer integration follows independently.
 
 ## Open questions
 

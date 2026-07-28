@@ -24,9 +24,13 @@ artifact or another registry failure stops the ceremony.
 
 ## One-time `0.0.0` package-name bootstrap
 
-This ceremony is pending. It reserves the npm name but does not advertise a
-production release. Perform it only after the implementation pull request is
-reviewed and merged.
+This ceremony completed on 2026-07-28. The signed annotated `v0.0.0` tag
+points to reviewed commit `9aa61e7ee87b93e7e34c49807ee2e448f368c78d`.
+The exact artifact is published under `bootstrap` with integrity
+`sha512-99rC2I3qlDUhdb/qYxwgVRoSIELKl5yyqhij7yy/FmrEe+hJuOMIaylAyR7D7rzliNVyoR+5f6PhworvZAx9QA==`.
+It reserves the npm name and is not an advertised production release. The
+commands below are retained as the historical, non-repeatable receipt; never
+reuse or republish `0.0.0`.
 
 From a clean checkout of the exact reviewed `origin/main` commit, use Node 24
 and the reviewed npm version:
@@ -44,9 +48,9 @@ npm run release:pack -- -- --require-clean --require-main-ancestor --output .rel
 npm run release:registry:check -- -- --manifest .release/package-manifest.json
 ```
 
-The registry check must report `@pegma/identity@0.0.0: absent`. Preserve the
-complete `.release` directory. Do not repack between review, tagging, and
-publication.
+Before that one-time publication, the registry check reported
+`@pegma/identity@0.0.0: absent`. The preserved release receipt subsequently
+reported `exact`. Do not repack between review, tagging, and publication.
 
 After confirming the repository `v*` ruleset blocks tag updates and deletion
 and restricts creation to the release maintainer, create the signed annotated
@@ -75,10 +79,10 @@ npm run release:registry:check -- -- --manifest .release/package-manifest.json
 npm dist-tag ls @pegma/identity
 ```
 
-The second registry check must report `exact`. Never unpublish and reuse a
+The second registry check reported `exact`. Never unpublish and reuse a
 version. Do not add an npm token.
 
-After the name exists, configure npm trusted publishing for:
+Trusted publishing for normal releases is configured for:
 
 - organization or user: `pegma-dev`
 - repository: `identity`
@@ -86,15 +90,16 @@ After the name exists, configure npm trusted publishing for:
 - environment: `npm-publish`
 - allowed action: `npm publish` only
 
-Create the matching GitHub environment and set `RELEASE_ALLOWED_SIGNERS` to
-the reviewed SSH allowed-signers public-key entry. The normal workflow
+The matching GitHub environment supplies the reviewed
+`RELEASE_ALLOWED_SIGNERS` SSH allowed-signers entry. The normal workflow
 deliberately refuses `0.0.0`.
 
 ## Normal release
 
-A release pull request updates the package and lockfile versions, status
-documentation, and release notes, then passes the complete gate on Node 22 and 24. After merge, create and verify a protected signed annotated tag on the
-exact `origin/main` commit:
+A release pull request updates the root, package, and lockfile versions,
+status documentation, and release notes, then passes the complete gate on Node
+22 and 24. After merge, create and verify a protected signed annotated tag on
+the exact `origin/main` commit:
 
 ```sh
 git fetch origin

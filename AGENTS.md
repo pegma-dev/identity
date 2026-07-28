@@ -63,3 +63,16 @@ specification.
 The plan is `docs/PROJECT_PLAN.md`. The sessions repository's discipline
 (hashed at rest, opposite delete rules, fail-closed) is the nearest
 precedent for the storage posture here.
+
+## Where things stand
+
+The audited `0.0.0` package is published under the `bootstrap` tag solely to
+reserve `@pegma/identity`. Version `0.1.0` is the first advertised stable
+release candidate. Its runtime and API were fixed by the reviewed
+user/email-index, durable email-code, Mail, and passkey implementation; release
+preparation may change only version metadata, status documentation, and release
+notes.
+
+Normal releases use the protected signed annotated `vX.Y.Z` tag and GitHub
+release workflow described in `docs/RELEASING.md`. Never publish a locally
+repacked artifact or add an npm token.
