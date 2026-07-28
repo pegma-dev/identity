@@ -1,0 +1,810 @@
+import { randomUUID } from "node:crypto";
+
+import { TableClient } from "@azure/data-tables";
+import type { RateLimiter } from "@pegma/rate-limit";
+import type { Clock, PrincipalId } from "@pegma/spine";
+import { createAzureTablesStore } from "@pegma/storage-azure-tables";
+import {
+  createMemoryStore,
+  type CollectionDefinition,
+  type CollectionStore,
+  type Store,
+} from "@pegma/storage-core";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const ceremony = vi.hoisted(() => ({
+  registrationChallenge: "registration_challenge",
+  authenticationChallenge: "authentication_challenge",
+  credentialId: "credential_one",
+  registrationCounter: 0,
+  authenticationCounter: 0,
+  authenticationVerified: true,
+}));
+
+vi.mock("@simplewebauthn/server", () => ({
+  async generateRegistrationOptions() {
+    return {
+      challenge: ceremony.registrationChallenge,
+      rp: { id: "example.test", name: "Example" },
+      user: {
+        id: "dXNlcg",
+        name: "person@example.test",
+        displayName: "",
+      },
+      pubKeyCredParams: [],
+      timeout: 60_000,
+      attestation: "none",
+      excludeCredentials: [],
+      authenticatorSelection: {
+        residentKey: "required",
+        requireResidentKey: true,
+        userVerification: "required",
+      },
+    };
+  },
+  async verifyRegistrationResponse(options: {
+    expectedChallenge:
+      string | ((candidate: string) => boolean | Promise<boolean>);
+  }) {
+    const challengeMatches =
+      typeof options.expectedChallenge === "string"
+        ? options.expectedChallenge === ceremony.registrationChallenge
+        : await options.expectedChallenge(ceremony.registrationChallenge);
+    if (!challengeMatches) {
+      return { verified: false };
+    }
+    return {
+      verified: true,
+      registrationInfo: {
+        userVerified: true,
+        credential: {
+          id: ceremony.credentialId,
+          publicKey: new Uint8Array([1, 2, 3, 4]),
+          counter: ceremony.registrationCounter,
+          transports: ["internal"],
+        },
+      },
+    };
+  },
+  async generateAuthenticationOptions() {
+    return {
+      challenge: ceremony.authenticationChallenge,
+      timeout: 60_000,
+      rpId: "example.test",
+      userVerification: "required",
+    };
+  },
+  async verifyAuthenticationResponse(options: {
+    expectedChallenge:
+      string | ((candidate: string) => boolean | Promise<boolean>);
+  }) {
+    const challengeMatches =
+      typeof options.expectedChallenge === "string"
+        ? options.expectedChallenge === ceremony.authenticationChallenge
+        : await options.expectedChallenge(ceremony.authenticationChallenge);
+    return {
+      verified: ceremony.authenticationVerified && challengeMatches,
+      authenticationInfo: {
+        credentialID: ceremony.credentialId,
+        newCounter: ceremony.authenticationCounter,
+        userVerified: true,
+        credentialDeviceType: "multiDevice",
+        credentialBackedUp: true,
+        origin: "https://example.test",
+        rpID: "example.test",
+      },
+    };
+  },
+}));
+
+import {
+  createIdentity,
+  createMemoryChallengeRetention,
+  IdentityError,
+  type ChallengeRetention,
+} from "./index.js";
+import { validCounterTransition } from "./passkeys.js";
+import { TABLE_PORT } from "../../../test/azurite.js";
+
+const CONNECTION_STRING =
+  "DefaultEndpointsProtocol=http;" +
+  "AccountName=devstoreaccount1;" +
+  "AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;" +
+  `TableEndpoint=http://127.0.0.1:${TABLE_PORT}/devstoreaccount1;`;
+
+const allow = {
+  async allow() {
+    return { allowed: true as const };
+  },
+};
+
+function createAzuriteStore(): Store {
+  const table = `identitypasskeys${randomUUID().replaceAll("-", "")}`;
+  const client = TableClient.fromConnectionString(CONNECTION_STRING, table, {
+    allowInsecureConnection: true,
+  });
+  return createAzureTablesStore({ client });
+}
+
+function registrationResponse() {
+  return {
+    id: ceremony.credentialId,
+    rawId: ceremony.credentialId,
+    type: "public-key" as const,
+    clientExtensionResults: {},
+    response: {
+      clientDataJSON: "client_data",
+      attestationObject: "attestation",
+      transports: ["internal" as const],
+    },
+  };
+}
+
+function authenticationResponse() {
+  return {
+    id: ceremony.credentialId,
+    rawId: ceremony.credentialId,
+    type: "public-key" as const,
+    clientExtensionResults: {},
+    response: {
+      clientDataJSON: "client_data",
+      authenticatorData: "authenticator_data",
+      signature: "signature",
+      userHandle: "user_handle",
+    },
+  };
+}
+
+function service(
+  store: Store = createMemoryStore(),
+  options: {
+    readonly clock?: Clock;
+    readonly newId?: () => string;
+    readonly authenticationLimiter?: RateLimiter;
+    readonly challengeRetention?: ChallengeRetention;
+  } = {},
+) {
+  return createIdentity({
+    store,
+    issuer: "https://issuer.example",
+    rpName: "Example",
+    rpID: "example.test",
+    origins: ["https://example.test"],
+    registrationLimiter: allow,
+    authenticationLimiter: options.authenticationLimiter ?? allow,
+    challengeRetention:
+      options.challengeRetention ?? createMemoryChallengeRetention(),
+    newId: options.newId ?? (() => randomUUID()),
+    ...(options.clock === undefined ? {} : { clock: options.clock }),
+  });
+}
+
+async function provision(identity: ReturnType<typeof service>) {
+  const principalId = "principal-passkeys" as PrincipalId;
+  await identity.provisionVerifiedUser({
+    principalId,
+    email: "person@example.test",
+  });
+  return principalId;
+}
+
+beforeEach(() => {
+  ceremony.registrationChallenge = "registration_challenge";
+  ceremony.authenticationChallenge = "authentication_challenge";
+  ceremony.credentialId = "credential_one";
+  ceremony.registrationCounter = 0;
+  ceremony.authenticationCounter = 0;
+  ceremony.authenticationVerified = true;
+});
+
+describe("passkey ceremonies", () => {
+  it("requires discoverable credentials and user verification", async () => {
+    const identity = service();
+    const principalId = await provision(identity);
+
+    const registration = await identity.beginPasskeyRegistration(
+      principalId,
+      "request-origin",
+    );
+    expect(registration.options.authenticatorSelection).toMatchObject({
+      residentKey: "required",
+      requireResidentKey: true,
+      userVerification: "required",
+    });
+
+    const authentication =
+      await identity.beginPasskeyAuthentication("request-origin");
+    expect(authentication.options.userVerification).toBe("required");
+    expect(authentication.options.allowCredentials).toBeUndefined();
+  });
+
+  it("stores multiple passkeys and authenticates into exact claims", async () => {
+    const identity = service();
+    const principalId = await provision(identity);
+
+    const first = await identity.beginPasskeyRegistration(
+      principalId,
+      "request-one",
+    );
+    await identity.finishPasskeyRegistration({
+      principalId,
+      challengeHandle: first.challengeHandle,
+      label: "Phone",
+      response: registrationResponse(),
+    });
+
+    ceremony.credentialId = "credential_two";
+    const second = await identity.beginPasskeyRegistration(
+      principalId,
+      "request-two",
+    );
+    await identity.finishPasskeyRegistration({
+      principalId,
+      challengeHandle: second.challengeHandle,
+      label: "Laptop",
+      response: registrationResponse(),
+    });
+
+    const passkeys = await identity.listPasskeys(principalId);
+    expect(passkeys.map(({ label }) => label).sort()).toEqual([
+      "Laptop",
+      "Phone",
+    ]);
+
+    ceremony.authenticationCounter = 0;
+    const authentication =
+      await identity.beginPasskeyAuthentication("request-three");
+    const claims = await identity.finishPasskeyAuthentication({
+      challengeHandle: authentication.challengeHandle,
+      response: authenticationResponse(),
+    });
+    expect(claims).toEqual({
+      issuer: "https://issuer.example",
+      subject: principalId,
+      emailVerified: true,
+    });
+    expect(Object.isFrozen(claims)).toBe(true);
+  });
+
+  it.each([
+    ["memory store", createMemoryStore],
+    ["Azurite", createAzuriteStore],
+  ] as const)(
+    "rejects nonzero counter equality and regression over %s",
+    async (_name, makeStore) => {
+      const identity = service(makeStore());
+      const principalId = await provision(identity);
+      ceremony.registrationCounter = 1;
+      const registration = await identity.beginPasskeyRegistration(
+        principalId,
+        "request-registration",
+      );
+      await identity.finishPasskeyRegistration({
+        principalId,
+        challengeHandle: registration.challengeHandle,
+        label: "Security key",
+        response: registrationResponse(),
+      });
+
+      for (const counter of [1, 0]) {
+        ceremony.authenticationCounter = counter;
+        const authentication = await identity.beginPasskeyAuthentication(
+          `request-${counter}`,
+        );
+        await expect(
+          identity.finishPasskeyAuthentication({
+            challengeHandle: authentication.challengeHandle,
+            response: authenticationResponse(),
+          }),
+        ).rejects.toMatchObject({ code: "verification_failed" });
+      }
+    },
+  );
+
+  it("allows only one concurrent assertion to claim an Azurite challenge", async () => {
+    const identity = service(createAzuriteStore());
+    const principalId = await provision(identity);
+    const registration = await identity.beginPasskeyRegistration(
+      principalId,
+      "request-registration",
+    );
+    await identity.finishPasskeyRegistration({
+      principalId,
+      challengeHandle: registration.challengeHandle,
+      label: "Security key",
+      response: registrationResponse(),
+    });
+    const authentication = await identity.beginPasskeyAuthentication(
+      "request-authentication",
+    );
+
+    const settled = await Promise.allSettled(
+      Array.from({ length: 8 }, () =>
+        identity.finishPasskeyAuthentication({
+          challengeHandle: authentication.challengeHandle,
+          response: authenticationResponse(),
+        }),
+      ),
+    );
+    expect(settled.filter(({ status }) => status === "fulfilled")).toHaveLength(
+      1,
+    );
+    expect(settled.filter(({ status }) => status === "rejected")).toHaveLength(
+      7,
+    );
+  });
+
+  it("revokes the global credential lookup before removing the user copy", async () => {
+    const identity = service();
+    const principalId = await provision(identity);
+    const registration = await identity.beginPasskeyRegistration(
+      principalId,
+      "request-registration",
+    );
+    await identity.finishPasskeyRegistration({
+      principalId,
+      challengeHandle: registration.challengeHandle,
+      label: "Phone",
+      response: registrationResponse(),
+    });
+
+    await expect(
+      identity.removePasskey(principalId, ceremony.credentialId),
+    ).resolves.toBe(true);
+    await expect(identity.listPasskeys(principalId)).resolves.toEqual([]);
+    const authentication = await identity.beginPasskeyAuthentication(
+      "request-authentication",
+    );
+    await expect(
+      identity.finishPasskeyAuthentication({
+        challengeHandle: authentication.challengeHandle,
+        response: authenticationResponse(),
+      }),
+    ).rejects.toMatchObject({ code: "verification_failed" });
+  });
+
+  it("does not let a stale repair snapshot reactivate a revoked generation", async () => {
+    const inner = createMemoryStore();
+    let armed = false;
+    let releaseSnapshot!: () => void;
+    let reportSnapshot!: () => void;
+    const snapshotTaken = new Promise<void>((resolve) => {
+      reportSnapshot = resolve;
+    });
+    const resumeSnapshot = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    const racing: Store = {
+      collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
+        const collection = inner.collection(definition);
+        if (definition.name !== "pegma_identity_credential_indexes") {
+          return collection;
+        }
+        return {
+          ...collection,
+          async get(key) {
+            const snapshot = await collection.get(key);
+            if (armed) {
+              armed = false;
+              reportSnapshot();
+              await resumeSnapshot;
+            }
+            return snapshot;
+          },
+        };
+      },
+    };
+    const identity = service(racing);
+    const principalId = await provision(identity);
+    const registration = await identity.beginPasskeyRegistration(
+      principalId,
+      "request-registration",
+    );
+    await identity.finishPasskeyRegistration({
+      principalId,
+      challengeHandle: registration.challengeHandle,
+      label: "Security key",
+      response: registrationResponse(),
+    });
+
+    armed = true;
+    const staleRepair = identity.repairPasskey(ceremony.credentialId);
+    await snapshotTaken;
+    await expect(
+      identity.removePasskey(principalId, ceremony.credentialId),
+    ).resolves.toBe(true);
+    releaseSnapshot();
+    await expect(staleRepair).rejects.toMatchObject({ code: "conflict" });
+
+    await expect(identity.listPasskeys(principalId)).resolves.toEqual([]);
+    await expect(
+      identity.repairPasskey(ceremony.credentialId),
+    ).resolves.toBeNull();
+    const authentication = await identity.beginPasskeyAuthentication(
+      "request-after-revocation",
+    );
+    await expect(
+      identity.finishPasskeyAuthentication({
+        challengeHandle: authentication.challengeHandle,
+        response: authenticationResponse(),
+      }),
+    ).rejects.toMatchObject({ code: "verification_failed" });
+  });
+
+  it("allows a freshly verified registration to replace a revoked generation", async () => {
+    const identity = service();
+    const principalId = await provision(identity);
+    const first = await identity.beginPasskeyRegistration(
+      principalId,
+      "first-registration",
+    );
+    await identity.finishPasskeyRegistration({
+      principalId,
+      challengeHandle: first.challengeHandle,
+      label: "Security key",
+      response: registrationResponse(),
+    });
+    await identity.removePasskey(principalId, ceremony.credentialId);
+
+    const second = await identity.beginPasskeyRegistration(
+      principalId,
+      "second-registration",
+    );
+    await identity.finishPasskeyRegistration({
+      principalId,
+      challengeHandle: second.challengeHandle,
+      label: "Replacement key",
+      response: registrationResponse(),
+    });
+
+    await expect(identity.listPasskeys(principalId)).resolves.toMatchObject([
+      {
+        credentialId: ceremony.credentialId,
+        label: "Replacement key",
+      },
+    ]);
+  });
+});
+
+describe("challenge controls", () => {
+  it("stores only hashes of handles and WebAuthn challenges", async () => {
+    const stored: unknown[] = [];
+    const inner = createMemoryStore();
+    const tracking: Store = {
+      collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
+        const collection = inner.collection(definition);
+        return {
+          ...collection,
+          async insertIfAbsent(value) {
+            if (definition.name === "pegma_identity_challenges") {
+              stored.push(value);
+            }
+            return collection.insertIfAbsent(value);
+          },
+        };
+      },
+    };
+    let id = 0;
+    const identity = service(tracking, {
+      newId: () => `generated_${(id += 1)}`,
+    });
+    const started = await identity.beginPasskeyAuthentication("request");
+
+    const serialized = JSON.stringify(stored);
+    expect(serialized).not.toContain(started.challengeHandle);
+    expect(serialized).not.toContain(ceremony.authenticationChallenge);
+    expect(serialized).toMatch(/[0-9a-f]{64}/u);
+  });
+
+  it("bounds attempts and makes one challenge single-flight", async () => {
+    const identity = service();
+    ceremony.authenticationVerified = false;
+    const started = await identity.beginPasskeyAuthentication("request");
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await expect(
+        identity.finishPasskeyAuthentication({
+          challengeHandle: started.challengeHandle,
+          response: authenticationResponse(),
+        }),
+      ).rejects.toMatchObject({ code: "verification_failed" });
+    }
+  });
+
+  it("keeps challenge material out of verification errors", async () => {
+    const identity = service();
+    ceremony.authenticationVerified = false;
+    const started = await identity.beginPasskeyAuthentication("request");
+
+    const error = await identity
+      .finishPasskeyAuthentication({
+        challengeHandle: started.challengeHandle,
+        response: authenticationResponse(),
+      })
+      .catch((reason: unknown) => reason);
+    expect(error).toBeInstanceOf(IdentityError);
+    expect((error as Error & { cause?: unknown }).cause).toBeUndefined();
+    expect(String(error)).not.toContain(started.challengeHandle);
+    expect(String(error)).not.toContain(ceremony.authenticationChallenge);
+  });
+
+  it("sweeps expired challenges with a bounded version-conditional pass", async () => {
+    let now = "2026-07-27T12:00:00.000Z";
+    const identity = service(createMemoryStore(), {
+      clock: { now: () => now },
+    });
+    await identity.beginPasskeyAuthentication("request");
+    now = "2026-07-27T12:06:00.000Z";
+
+    await expect(identity.sweepChallenges(1)).resolves.toEqual({
+      pulled: 1,
+      inspected: 1,
+      deleted: 1,
+      completed: 1,
+      rejected: 0,
+      hasMore: true,
+    });
+    await expect(identity.sweepChallenges(1)).resolves.toEqual({
+      pulled: 0,
+      inspected: 0,
+      deleted: 0,
+      completed: 0,
+      rejected: 0,
+      hasMore: false,
+    });
+  });
+
+  it("pulls at most one lazy candidate for sweep(1) and never scans or deletes an unrelated row", async () => {
+    const references: Array<{
+      readonly retentionId: string;
+      readonly handleHash: string;
+      readonly expiresAt: string;
+    }> = [];
+    let sourcePulls = 0;
+    let versionedGets = 0;
+    let partitionScans = 0;
+    const deletedIds: string[] = [];
+    const retention: ChallengeRetention = {
+      async track(reference) {
+        references.push(reference);
+      },
+      async *candidates() {
+        for (const reference of references) {
+          sourcePulls += 1;
+          yield reference;
+        }
+      },
+      async complete() {},
+    };
+    const inner = createMemoryStore();
+    const tracking: Store = {
+      collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
+        const collection = inner.collection(definition);
+        if (definition.name !== "pegma_identity_challenges") {
+          return collection;
+        }
+        return {
+          ...collection,
+          async getVersioned(key) {
+            versionedGets += 1;
+            return collection.getVersioned(key);
+          },
+          async listVersioned(partition) {
+            partitionScans += 1;
+            return collection.listVersioned(partition);
+          },
+          async deleteIfUnchanged(key, version) {
+            deletedIds.push(key.id);
+            return collection.deleteIfUnchanged(key, version);
+          },
+        };
+      },
+    };
+    let now = "2026-07-27T12:00:00.000Z";
+    const identity = service(tracking, {
+      clock: { now: () => now },
+      challengeRetention: retention,
+    });
+    await identity.beginPasskeyAuthentication("first");
+    await identity.beginPasskeyAuthentication("second");
+    now = "2026-07-27T12:06:00.000Z";
+
+    const result = await identity.sweepChallenges(1);
+
+    expect(sourcePulls).toBe(1);
+    expect(versionedGets).toBe(1);
+    expect(partitionScans).toBe(0);
+    expect(deletedIds).toEqual([references[0]?.handleHash]);
+    expect(deletedIds).not.toContain(references[1]?.handleHash);
+    expect(result).toMatchObject({
+      pulled: 1,
+      inspected: 1,
+      deleted: 1,
+      hasMore: true,
+    });
+  });
+
+  it("closes a lazy retention iterator when the sweep budget is exhausted", async () => {
+    const references: Array<{
+      readonly retentionId: string;
+      readonly handleHash: string;
+      readonly expiresAt: string;
+    }> = [];
+    let finalized = false;
+    const retention: ChallengeRetention = {
+      async track(reference) {
+        references.push(reference);
+      },
+      async *candidates() {
+        try {
+          yield* references;
+        } finally {
+          finalized = true;
+        }
+      },
+      async complete() {},
+    };
+    let now = "2026-07-27T12:00:00.000Z";
+    const identity = service(createMemoryStore(), {
+      clock: { now: () => now },
+      challengeRetention: retention,
+    });
+    await identity.beginPasskeyAuthentication("first");
+    await identity.beginPasskeyAuthentication("second");
+    now = "2026-07-27T12:06:00.000Z";
+
+    await identity.sweepChallenges(1);
+
+    expect(finalized).toBe(true);
+  });
+
+  it("tracks retention before inserting an authoritative challenge", async () => {
+    let challengeInserts = 0;
+    const inner = createMemoryStore();
+    const tracking: Store = {
+      collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
+        const collection = inner.collection(definition);
+        if (definition.name !== "pegma_identity_challenges") {
+          return collection;
+        }
+        return {
+          ...collection,
+          async insertIfAbsent(value) {
+            challengeInserts += 1;
+            return collection.insertIfAbsent(value);
+          },
+        };
+      },
+    };
+    const retention: ChallengeRetention = {
+      async track() {
+        throw new Error("retention unavailable");
+      },
+      async *candidates() {},
+      async complete() {},
+    };
+    const identity = service(tracking, { challengeRetention: retention });
+
+    await expect(
+      identity.beginPasskeyAuthentication("request"),
+    ).rejects.toMatchObject({ code: "invalid_state" });
+    expect(challengeInserts).toBe(0);
+  });
+
+  it("rejects accessor references and safely handles wrong, stale, and duplicate candidates", async () => {
+    const tracked: Array<{
+      readonly retentionId: string;
+      readonly handleHash: string;
+      readonly expiresAt: string;
+    }> = [];
+    let candidates: unknown[] = [];
+    let getters = 0;
+    const retention: ChallengeRetention = {
+      async track(reference) {
+        tracked.push(reference);
+      },
+      async *candidates() {
+        yield* candidates;
+      },
+      async complete() {},
+    };
+    let now = "2026-07-27T12:00:00.000Z";
+    const identity = service(createMemoryStore(), {
+      clock: { now: () => now },
+      challengeRetention: retention,
+    });
+    await identity.beginPasskeyAuthentication("request");
+    const actual = tracked[0];
+    if (actual === undefined) {
+      throw new Error("expected a tracked challenge");
+    }
+    const accessor = Object.create(null, {
+      retentionId: { enumerable: true, value: actual.retentionId },
+      handleHash: {
+        enumerable: true,
+        get() {
+          getters += 1;
+          return actual.handleHash;
+        },
+      },
+      expiresAt: { enumerable: true, value: actual.expiresAt },
+    });
+    candidates = [
+      accessor,
+      {
+        retentionId: actual.retentionId,
+        handleHash: actual.handleHash,
+        expiresAt: "2026-07-27T12:04:00.000Z",
+      },
+      {
+        retentionId: "b".repeat(64),
+        handleHash: "a".repeat(64),
+        expiresAt: actual.expiresAt,
+      },
+      actual,
+      actual,
+    ];
+    now = "2026-07-27T12:06:00.000Z";
+
+    await expect(identity.sweepChallenges(5)).resolves.toMatchObject({
+      pulled: 5,
+      inspected: 4,
+      deleted: 1,
+      rejected: 1,
+      hasMore: true,
+    });
+    expect(getters).toBe(0);
+  });
+
+  it("fails closed when the host rate limiter refuses", async () => {
+    const identity = service(createMemoryStore(), {
+      authenticationLimiter: {
+        async allow() {
+          return { allowed: false as const, retryAfter: 5_000 };
+        },
+      },
+    });
+    await expect(
+      identity.beginPasskeyAuthentication("request"),
+    ).rejects.toMatchObject({
+      code: "rate_limited",
+      retryAfter: 5_000,
+    });
+  });
+});
+
+describe("malformed inputs and counter rules", () => {
+  it("rejects nested accessors before challenge lookup and executes no getter", async () => {
+    let getters = 0;
+    const response = Object.create(null, {
+      id: {
+        enumerable: true,
+        get() {
+          getters += 1;
+          return "credential_attacker";
+        },
+      },
+    });
+    await expect(
+      service().finishPasskeyAuthentication({
+        challengeHandle: "unknown_challenge",
+        response,
+      }),
+    ).rejects.toBeInstanceOf(IdentityError);
+    expect(getters).toBe(0);
+  });
+
+  it.each([
+    [0, 0, true],
+    [0, 1, true],
+    [1, 2, true],
+    [1, 1, false],
+    [2, 1, false],
+    [1, 0, false],
+  ])(
+    "evaluates counter transition %i -> %i as %s",
+    (stored, reported, expected) => {
+      expect(validCounterTransition(stored, reported)).toBe(expected);
+    },
+  );
+});
