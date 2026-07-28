@@ -7,10 +7,10 @@ email-code fallback, **no passwords** — user records in your own storage, no
 external provider.
 
 > [!IMPORTANT]
-> Identity is in early planning. Nothing is built or published, and
-> implementation is deliberately queued behind the components it composes
-> (sessions, rate-limit, mail). See
-> [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md).
+> Identity now has an audited `0.0.0` package scaffold plus its user/email
+> index and passkey foundations. It is not yet an advertised production
+> release. Email-code flows remain deliberately blocked on
+> `@pegma/mail@0.1.0`; see [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md).
 
 ## What it is — and refuses to be
 

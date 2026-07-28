@@ -2,9 +2,12 @@
 
 ## Status
 
-**Stage:** planning; nothing built. Implementation is deliberately queued
-BEHIND the current dispatch lanes (webhooks, sessions, the D1 adapter) —
-see Timing. (`0.x`, unpublished.)
+**Stage:** foundation implemented (`0.0.0`, unpublished). Phase 1's
+user/email-index model and Phase 3's passkey/challenge foundation are built
+and tested over memory plus real Azurite races. Phase 2 email-code delivery is
+deliberately blocked on `@pegma/mail@0.1.0`; no local mail contract has been
+invented. The threat model and hardened release scaffold landed early because
+they gate every identity change.
 
 **License:** MIT
 
@@ -164,34 +167,34 @@ breach; it gets the ceremony that deserves.
 ## Package architecture
 
 One package: `packages/identity` publishing `@pegma/identity`.
-Dependencies: `@pegma/spine`, `@pegma/storage-core`, and a WebAuthn
-server-side library (lean `@simplewebauthn/server` — the boring, maintained
-choice; wrapping it thinly is Phase 3's first decision). Framework-free:
-flows are functions the host's HTTP layer calls, same posture as every
-Pegma component.
+Dependencies: exact `@pegma/spine@0.1.1`,
+`@pegma/storage-core@0.4.0`, `@pegma/rate-limit@0.1.0`, and
+`@simplewebauthn/server@13.3.2`, `unicode-case-folding@1.1.1`,
+`unorm@1.6.0`, and `tr46@6.0.0`. Framework-free flows are functions the host's
+HTTP layer calls, same posture as every Pegma component.
 
 ## Delivery phases
 
-### Phase 1 — the user store
+### Phase 1 — the user store (implemented)
 
 User + email-index collections, canonical normalization, structural
 uniqueness, the claims shape. Race tests: concurrent same-email creation
 converges on one user.
 
-### Phase 2 — the email-code flows
+### Phase 2 — the email-code flows (pending `@pegma/mail@0.1.0`)
 
 Creation, verification, fallback sign-in, recovery, email change — the
 full lifecycle WITHOUT passkeys (a passwordless-by-email component is
 already usable). Enumeration-resistance tests pin uniform responses;
 rate-limit integration lands here.
 
-### Phase 3 — passkeys
+### Phase 3 — passkeys (foundation implemented)
 
 Registration and authentication ceremonies, credential management,
 counter handling. Exit: a host can run passkey-only sign-in with email
 strictly as enrollment/recovery.
 
-### Phase 4 — threat model, review, first consumer
+### Phase 4 — threat model, review, first consumer (threat model implemented)
 
 THREAT_MODEL.md, an adversarial security pass, and a real consumer wired
 end-to-end (candidate: the pegma.dev Workers slice, or a demo host; the
@@ -200,11 +203,11 @@ First publish follows the ecosystem bootstrap rule (npm/cli#8544).
 
 ## Timing
 
-Behind the current queue on purpose: it CONSUMES sessions (issuance),
-rate-limit (throttles), and the mail/outbox story — building it first
-would mean building them inside it, which is how ecosystems grow lumps.
-Plan now, dispatch when sessions Phase 1 and rate-limit's durable tier
-exist.
+The storage, rate-limit, and WebAuthn prerequisites now exist, so the
+independent Phase 1 and Phase 3 foundations are implemented. Email-code
+enrollment, fallback, recovery, email change, notification, and durable
+delivery remain queued behind `@pegma/mail@0.1.0`. This repository will not
+copy the support desk's local mail shape or invent a competing contract.
 
 ## Open questions
 

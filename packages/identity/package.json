@@ -1,0 +1,46 @@
+{
+  "name": "@pegma/identity",
+  "version": "0.0.0",
+  "description": "Passkeys-first, passwordless first-party identity for Pegma hosts.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist/**/*.d.ts",
+    "dist/**/*.d.ts.map",
+    "dist/**/*.js",
+    "dist/**/*.js.map"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pegma-dev/identity.git",
+    "directory": "packages/identity"
+  },
+  "dependencies": {
+    "@pegma/rate-limit": "0.1.0",
+    "@pegma/spine": "0.1.1",
+    "@pegma/storage-core": "0.4.0",
+    "@simplewebauthn/server": "13.3.2",
+    "punycode": "2.3.1",
+    "tr46": "6.0.0",
+    "unicode-case-folding": "1.1.1",
+    "unorm": "1.6.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "prepack": "npm run build"
+  }
+}
