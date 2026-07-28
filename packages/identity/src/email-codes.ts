@@ -258,7 +258,12 @@ export function createEmailCodeService(
         ),
       );
     }
-    if (!(await Promise.all(checks)).every(Boolean)) {
+    const results = await Promise.allSettled(checks);
+    if (
+      results.some(
+        (result) => result.status === "rejected" || result.value !== true,
+      )
+    ) {
       throw new IdentityError(
         "storage_corrupt",
         "Stored email operation binding is malformed.",

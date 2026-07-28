@@ -241,6 +241,66 @@ function failEmailChangeClaimOnce(inner: Store): {
   };
 }
 
+function failEmailChangeSwitchOnce(inner: Store): {
+  readonly store: Store;
+  arm(): void;
+} {
+  let armed = false;
+  return {
+    store: {
+      collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
+        const collection = inner.collection(definition);
+        if (definition.name !== "pegma_identity_users") {
+          return collection;
+        }
+        return new Proxy(collection, {
+          get(target, property, receiver) {
+            if (property === "update") {
+              return async (
+                key: EntityKey,
+                decide: UpdateDecider<T>,
+                updateOptions?: UpdateOptions,
+              ) => {
+                const guarded: UpdateDecider<T> = async (current) => {
+                  const decision = await decide(current);
+                  const before = current as UserRecord | null;
+                  const after =
+                    decision.action === "write"
+                      ? (decision.value as UserRecord)
+                      : null;
+                  if (
+                    armed &&
+                    before !== null &&
+                    after !== null &&
+                    before.emailChangeOperationHash !== null &&
+                    after.emailChangeOperationHash ===
+                      before.emailChangeOperationHash &&
+                    after.emailHash !== before.emailHash
+                  ) {
+                    armed = false;
+                    throw new Error("simulated loss before email switch");
+                  }
+                  return decision;
+                };
+                return updateOptions === undefined
+                  ? target.update(key, guarded)
+                  : target.update(key, guarded, updateOptions);
+              };
+            }
+            const member = Reflect.get(target, property, receiver) as unknown;
+            return typeof member === "function"
+              ? (member as (...input: unknown[]) => unknown).bind(target)
+              : member;
+          },
+        });
+      },
+    },
+    arm() {
+      armed = true;
+    },
+  };
+}
+
 function substituteOperationBeforeCas(inner: Store): {
   readonly store: Store;
   arm(codeVerifier: string): void;
@@ -446,32 +506,38 @@ describe("email-code flows", () => {
     });
   });
 
-  it("lets exactly one concurrent correct verification consume a code", async () => {
-    const { identity, protector } = fixture();
-    const started = await identity.beginAccountCreation(
-      "race@example.test",
-      "source",
-    );
-    const code = await codeFor(protector, started.codeHandle);
-    const results = await Promise.allSettled(
-      Array.from({ length: 12 }, () =>
-        identity.finishAccountCreation({
-          codeHandle: started.codeHandle,
-          code,
-          rateLimitKey: "source",
-        }),
-      ),
-    );
+  it.each([
+    ["memory", createMemoryStore],
+    ["Azurite", createAzuriteStore],
+  ] as const)(
+    "lets exactly one concurrent correct verification consume a code over %s",
+    async (_name, makeStore) => {
+      const { identity, protector } = fixture(makeStore());
+      const started = await identity.beginAccountCreation(
+        "race@example.test",
+        "source",
+      );
+      const code = await codeFor(protector, started.codeHandle);
+      const results = await Promise.allSettled(
+        Array.from({ length: 12 }, () =>
+          identity.finishAccountCreation({
+            codeHandle: started.codeHandle,
+            code,
+            rateLimitKey: "source",
+          }),
+        ),
+      );
 
-    expect(results.filter(({ status }) => status === "fulfilled")).toHaveLength(
-      1,
-    );
-    for (const result of results) {
-      if (result.status === "rejected") {
-        expect(result.reason).toMatchObject({ code: "verification_failed" });
+      expect(
+        results.filter(({ status }) => status === "fulfilled"),
+      ).toHaveLength(1);
+      for (const result of results) {
+        if (result.status === "rejected") {
+          expect(result.reason).toMatchObject({ code: "verification_failed" });
+        }
       }
-    }
-  });
+    },
+  );
 
   it("cannot consume a verifier row substituted after verification", async () => {
     const substituting = substituteOperationBeforeCas(createMemoryStore());
@@ -1328,6 +1394,61 @@ describe("email-code flows", () => {
     expect(send).not.toHaveBeenCalled();
   });
 
+  it("normalizes rejected canonical bindings across verification, sweep, and Mail", async () => {
+    const { identity, protector, store } = fixture();
+    await identity.provisionVerifiedUser({
+      principalId: "canonical-poison-owner" as PrincipalId,
+      email: "canonical@example.test",
+    });
+    const started = await identity.beginEmailSignIn(
+      "canonical@example.test",
+      "source",
+    );
+    const handleHash = await emailCodeHandleHash(started.codeHandle);
+    const partition = `email-operation-${handleHash}`;
+    const operations = store.collection(emailOperationsCollection);
+    const operation = await operations.get({ partition, id: handleHash });
+    if (operation?.kind !== "operation") {
+      throw new Error("operation fixture was not created");
+    }
+    await operations.put({
+      ...operation,
+      targetEmail: "not a canonical email",
+    });
+
+    await expect(
+      identity.finishEmailSignIn({
+        codeHandle: started.codeHandle,
+        code: await codeFor(protector, started.codeHandle),
+        rateLimitKey: "source",
+      }),
+    ).rejects.toMatchObject({ code: "storage_corrupt" });
+    await expect(identity.sweepEmailOperations()).resolves.toMatchObject({
+      rejected: 1,
+    });
+
+    const send = vi.fn(async (_request: MailSendRequest) => ({
+      providerMessageRef: "must-not-send",
+    }));
+    const render = vi.fn(async (_content: IdentityMailContent) => ({
+      subject: "Must not render",
+      text: "Must not render",
+    }));
+    const worker = identity.createMailWorker({
+      provider: { send },
+      reconciliation: {
+        async reconcile() {
+          return { status: "unknown" as const };
+        },
+      },
+      renderer: { render },
+      workerId: "canonical-poison-worker",
+    });
+    await worker.runSendPage({ limit: 100 });
+    expect(render).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
   it("renders only a neutral notice after the code is consumed", async () => {
     const { identity, protector } = fixture();
     await identity.provisionVerifiedUser({
@@ -1577,6 +1698,56 @@ describe.each([
       principalId: results[0]?.subject,
       emailVerified: true,
       status: "active",
+    });
+  });
+
+  it("resumes after retiring the old index before switching the user", async () => {
+    const failing = failEmailChangeSwitchOnce(makeStore());
+    const { identity, protector } = fixture(failing.store, {
+      newId: () => randomUUID(),
+    });
+    const principalId = `retiring-resume-${_name}` as PrincipalId;
+    await identity.provisionVerifiedUser({
+      principalId,
+      email: `retiring-old-${_name.toLowerCase()}@example.test`,
+    });
+    const started = await identity.beginEmailChange(
+      principalId,
+      `retiring-new-${_name.toLowerCase()}@example.test`,
+      "source",
+    );
+    failing.arm();
+    await expect(
+      identity.finishEmailChange({
+        principalId,
+        codeHandle: started.codeHandle,
+        code: await codeFor(protector, started.codeHandle),
+        rateLimitKey: "source",
+      }),
+    ).rejects.toThrow("simulated loss before email switch");
+
+    await expect(identity.sweepEmailOperations()).resolves.toMatchObject({
+      repaired: 1,
+      failed: 0,
+    });
+    await expect(identity.getUser(principalId)).resolves.toMatchObject({
+      email: `retiring-new-${_name.toLowerCase()}@example.test`,
+    });
+
+    const later = await identity.beginEmailChange(
+      principalId,
+      `retiring-later-${_name.toLowerCase()}@example.test`,
+      "later",
+    );
+    await expect(
+      identity.finishEmailChange({
+        principalId,
+        codeHandle: later.codeHandle,
+        code: await codeFor(protector, later.codeHandle),
+        rateLimitKey: "later",
+      }),
+    ).resolves.toMatchObject({
+      email: `retiring-later-${_name.toLowerCase()}@example.test`,
     });
   });
 });

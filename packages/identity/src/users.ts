@@ -632,15 +632,20 @@ export function createUserService(options: UserServiceOptions): UserService {
 
       if (!alreadySwitched && expectedOldHash !== newEmailHash) {
         const oldIndex = await indexes.get(emailKey(expectedOldHash));
+        const resumableState =
+          oldIndex?.state === "active"
+            ? oldIndex.changeOperationHash === null &&
+              oldIndex.replacementEmailHash === null
+            : oldIndex?.state === "retiring" &&
+              oldIndex.changeOperationHash === operationHash &&
+              oldIndex.replacementEmailHash === newEmailHash;
         if (
           oldIndex === null ||
-          oldIndex.state !== "active" ||
           oldIndex.principalId !== requestedPrincipal ||
           oldIndex.principalHash !== ownerHash ||
           oldIndex.email !== oldEmail ||
           oldIndex.emailHash !== expectedOldHash ||
-          oldIndex.changeOperationHash !== null ||
-          oldIndex.replacementEmailHash !== null
+          !resumableState
         ) {
           await rejectBeforeClaim();
         }
