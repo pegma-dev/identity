@@ -1750,6 +1750,49 @@ describe.each([
       email: `retiring-later-${_name.toLowerCase()}@example.test`,
     });
   });
+
+  it("keeps an expired unattempted operation decodable until retention", async () => {
+    let now = "2026-07-28T12:00:00.000Z" as IsoTimestamp;
+    const store = makeStore();
+    const { identity } = fixture(store, {
+      clock: { now: () => now },
+      retentionMs: 1,
+    });
+    const started = await identity.beginRecovery(
+      `expiry-${_name.toLowerCase()}@example.test`,
+      "source",
+    );
+    const handleHash = await emailCodeHandleHash(started.codeHandle);
+    const operations = store.collection(emailOperationsCollection);
+
+    now = "2026-07-28T12:15:00.000Z" as IsoTimestamp;
+    await expect(identity.sweepEmailOperations()).resolves.toMatchObject({
+      failed: 1,
+      rejected: 0,
+    });
+    await expect(
+      operations.get({
+        partition: `email-operation-${handleHash}`,
+        id: handleHash,
+      }),
+    ).resolves.toMatchObject({
+      kind: "operation",
+      state: "failed",
+      attempts: 1,
+    });
+
+    now = "2026-07-28T12:15:00.002Z" as IsoTimestamp;
+    await expect(identity.sweepEmailOperations()).resolves.toMatchObject({
+      rejected: 0,
+      deleted: 1,
+    });
+    await expect(
+      operations.get({
+        partition: `email-operation-${handleHash}`,
+        id: handleHash,
+      }),
+    ).resolves.toBeNull();
+  });
 });
 import { randomUUID } from "node:crypto";
 

@@ -945,6 +945,7 @@ export function createEmailCodeService(
                     value: {
                       ...current,
                       state: "failed",
+                      attempts: Math.max(1, current.attempts),
                       consumedAt: timestampFromClock(options.clock).value,
                       updatedAt: timestampFromClock(options.clock).value,
                     },
