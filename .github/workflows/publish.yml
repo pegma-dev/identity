@@ -23,7 +23,6 @@ jobs:
       RELEASE_COMMIT: ${{ github.sha }}
       RELEASE_ALLOWED_SIGNERS: ${{ vars.RELEASE_ALLOWED_SIGNERS }}
       NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-      NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/identity-public.npmrc
 
     steps:
       - name: Check out the release tag
@@ -52,7 +51,10 @@ jobs:
           git config --local gpg.ssh.allowedSignersFile "${allowed_signers}"
 
       - name: Isolate the public npm registry
-        run: printf 'registry=https://registry.npmjs.org/\n' > "${NPM_CONFIG_USERCONFIG}"
+        run: |
+          npm_config="${RUNNER_TEMP}/identity-public.npmrc"
+          printf 'registry=https://registry.npmjs.org/\n' > "${npm_config}"
+          echo "NPM_CONFIG_USERCONFIG=${npm_config}" >> "${GITHUB_ENV}"
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
