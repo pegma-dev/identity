@@ -23,6 +23,7 @@ const REQUIRED_DEPENDENCIES = {
   "@pegma/spine": "0.1.1",
   "@pegma/storage-core": "0.4.0",
   "@simplewebauthn/server": "13.3.2",
+  punycode: "2.3.1",
   tr46: "6.0.0",
   "unicode-case-folding": "1.1.1",
   unorm: "1.6.0",
