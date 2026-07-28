@@ -2,19 +2,20 @@
 
 ## Status
 
-**Stage:** first advertised stable release (`0.1.0`), published.
+**Stage:** Phases 1–4 are complete. `@pegma/identity@0.1.0` is published and
+live in pegma.dev with `@pegma/authorization-identity@0.1.2`. The public API
+remains unstable.
+
 The audited `0.0.0` name-reservation bootstrap is published and deliberately
 unadvertised. Version `0.1.0` contains the reviewed full passwordless
-lifecycle. It was published from the protected, signed annotated `v0.1.0` tag
+lifecycle and was published from the protected, signed annotated `v0.1.0` tag
 through the hardened GitHub Actions workflow using npm trusted publishing.
 The user/email-index model, durable email-code creation/fallback/recovery and
 email-change lifecycle, and passkey/challenge foundation are built and tested
 over memory plus real Azurite races. Mail delivery uses exact
 `@pegma/mail@0.1.0`; Identity owns the operation/Mail union required to commit
 code state and delivery intent atomically. The threat model and hardened
-release scaffold gate every identity change. The first-party pegma.dev host
-now composes `@pegma/identity@0.1.0` with
-`@pegma/authorization-identity@0.1.2`.
+release scaffold gate every identity change.
 
 **License:** MIT
 
