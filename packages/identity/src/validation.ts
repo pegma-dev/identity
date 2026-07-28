@@ -8,6 +8,8 @@ const HASH = /^[0-9a-f]{64}$/u;
 const BASE64URL = /^[A-Za-z0-9_-]+$/u;
 const MAX_STRUCTURED_NODES = 2_000;
 const MAX_STRUCTURED_DEPTH = 16;
+const MAX_STRUCTURED_STRING_BYTES = 64 * 1_024;
+const MAX_STRUCTURED_TOTAL_STRING_BYTES = 256 * 1_024;
 
 export function assertBoundedString(
   value: unknown,
@@ -225,7 +227,41 @@ export function parseStringArray(
  */
 export function copyDataOnly(value: unknown): unknown {
   let nodes = 0;
+  let stringBytes = 0;
   const seen = new Set<object>();
+
+  function countString(current: string): void {
+    let bytes = 0;
+    for (let index = 0; index < current.length; index += 1) {
+      const code = current.charCodeAt(index);
+      if (code <= 0x7f) {
+        bytes += 1;
+      } else if (code <= 0x7ff) {
+        bytes += 2;
+      } else if (
+        code >= 0xd800 &&
+        code <= 0xdbff &&
+        index + 1 < current.length &&
+        current.charCodeAt(index + 1) >= 0xdc00 &&
+        current.charCodeAt(index + 1) <= 0xdfff
+      ) {
+        bytes += 4;
+        index += 1;
+      } else {
+        bytes += 3;
+      }
+      if (
+        bytes > MAX_STRUCTURED_STRING_BYTES ||
+        stringBytes + bytes > MAX_STRUCTURED_TOTAL_STRING_BYTES
+      ) {
+        throw new IdentityError(
+          "invalid_input",
+          "Structured input is too large.",
+        );
+      }
+    }
+    stringBytes += bytes;
+  }
 
   function copy(current: unknown, depth: number): unknown {
     nodes += 1;
@@ -235,11 +271,11 @@ export function copyDataOnly(value: unknown): unknown {
         "Structured input is too large.",
       );
     }
-    if (
-      current === null ||
-      typeof current === "string" ||
-      typeof current === "boolean"
-    ) {
+    if (typeof current === "string") {
+      countString(current);
+      return current;
+    }
+    if (current === null || typeof current === "boolean") {
       return current;
     }
     if (typeof current === "number") {
@@ -309,6 +345,7 @@ export function copyDataOnly(value: unknown): unknown {
         );
       }
       for (const key of keys) {
+        countString(key);
         const descriptor = descriptors[key];
         if (
           descriptor === undefined ||

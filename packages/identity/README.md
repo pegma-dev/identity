@@ -155,7 +155,11 @@ verified by the exact pinned `@simplewebauthn/server` version against the
 configured RP ID, origin allowlist, stored challenge digest, user presence,
 and required user verification. A stored and newly reported zero counter is
 accepted because some authenticators do not implement counters; once a
-nonzero counter exists, every report must be strictly greater.
+nonzero counter exists, every report must be strictly greater. Positive
+counter mirror updates use a durable repairable transition, so a process crash
+between the credential-index and per-user writes cannot strand the passkey.
+Structured ceremony inputs are rejected before verification when any string
+or property name exceeds 64 KiB of UTF-8 or their aggregate exceeds 256 KiB.
 
 ## License
 

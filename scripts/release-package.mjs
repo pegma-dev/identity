@@ -78,6 +78,14 @@ function sameJson(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function directDependencyLockEntry(lock, name, version) {
+  const candidates = [
+    lock.packages?.[`${PACKAGE_DIRECTORY}/node_modules/${name}`],
+    lock.packages?.[`node_modules/${name}`],
+  ];
+  return candidates.find((entry) => entry?.version === version);
+}
+
 function safeEqual(left, right) {
   const leftBytes = Buffer.from(left);
   const rightBytes = Buffer.from(right);
@@ -203,6 +211,20 @@ export async function validateRepository(root = defaultRoot()) {
     !sameJson(lockEntry?.dependencies, REQUIRED_DEPENDENCIES)
   ) {
     fail("runtime dependencies must match the reviewed exact pins");
+  }
+  for (const [name, version] of Object.entries(REQUIRED_DEPENDENCIES)) {
+    const dependency = directDependencyLockEntry(lock, name, version);
+    if (
+      dependency === undefined ||
+      typeof dependency.resolved !== "string" ||
+      !dependency.resolved.startsWith("https://registry.npmjs.org/") ||
+      typeof dependency.integrity !== "string" ||
+      !dependency.integrity.startsWith("sha512-")
+    ) {
+      fail(
+        `direct runtime dependency ${name}@${version} lacks public-registry provenance`,
+      );
+    }
   }
   if (
     lockEntry?.name !== PACKAGE_NAME ||

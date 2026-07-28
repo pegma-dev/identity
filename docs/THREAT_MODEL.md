@@ -91,6 +91,12 @@ Security invariants:
   cannot permanently starve committed work.
 - A positive nonzero signature counter must strictly increase. A counter may
   remain zero only when both stored and newly reported values are zero.
+  Positive advances pass through a durable `counter-pending` state: the
+  credential index retains the verifier's old counter and target counter until
+  the independently stored passkey mirror reaches exactly that target, after
+  which repair finalizes the index. A crash on either side of the mirror write
+  is replayable without weakening owner, generation, or counter-regression
+  checks.
 - Raw token-shaped values, future one-time codes, and challenge verification
   material never enter storage, logs, or error messages.
 - Malformed storage and malformed/accessor-bearing request objects fail
@@ -159,9 +165,11 @@ states are retained for investigation and never promoted.
 
 Object-shape attacks can hide work in getters or prototypes. Public structured
 inputs are copied from property descriptors only after rejecting accessors,
-symbol keys, non-plain prototypes, cycles, and excessive depth/size. The
-WebAuthn dependency receives the inert copy. Public outputs are newly
-allocated, own-data-only, and frozen.
+symbol keys, non-plain prototypes, cycles, and excessive depth/size. Every
+string value and object key is limited to 64 KiB in UTF-8, with a 256 KiB
+aggregate string budget for one structured input. The WebAuthn dependency
+receives the inert bounded copy. Public outputs are newly allocated,
+own-data-only, and frozen.
 
 Dependency and release compromise matter because this library executes in an
 authentication path. Runtime versions are exact, the lockfile is reviewed,

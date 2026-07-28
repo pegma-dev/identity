@@ -84,7 +84,8 @@ export interface PasskeyRecord {
   readonly lastUsedAt: string | null;
 }
 
-export type CredentialIndexState = "reserved" | "active" | "revoked";
+export type CredentialIndexState =
+  "reserved" | "active" | "counter-pending" | "revoked";
 
 export interface CredentialIndexRecord {
   readonly partition: string;
@@ -97,6 +98,7 @@ export interface CredentialIndexRecord {
   readonly principalHash: string;
   readonly publicKey: string;
   readonly counter: number;
+  readonly nextCounter: number;
   readonly transports: readonly string[];
   readonly label: string;
   readonly state: CredentialIndexState;
@@ -389,12 +391,21 @@ function decodeCredentialIndex(record: StoredRecord): CredentialIndexRecord {
     partition: storedString(record, "partition", 96),
     id: hash(record, "id"),
     ...fields,
+    nextCounter: storedSafeInteger(record, "nextCounter"),
     registrationProofHash: hash(record, "registrationProofHash"),
-    state: enumValue(record, "state", ["reserved", "active", "revoked"]),
+    state: enumValue(record, "state", [
+      "reserved",
+      "active",
+      "counter-pending",
+      "revoked",
+    ]),
   };
   if (
     decoded.id !== decoded.credentialHash ||
-    decoded.partition !== `credential-${decoded.credentialHash.slice(0, 16)}`
+    decoded.partition !== `credential-${decoded.credentialHash.slice(0, 16)}` ||
+    (decoded.state === "counter-pending"
+      ? decoded.nextCounter <= decoded.counter
+      : decoded.nextCounter !== decoded.counter)
   ) {
     throw new IdentityError(
       "storage_corrupt",
@@ -413,6 +424,7 @@ export const credentialIndexesCollection =
         partition: value.partition,
         id: value.id,
         ...encodePasskeyFields(value),
+        nextCounter: value.nextCounter,
         registrationProofHash: value.registrationProofHash,
         state: value.state,
       }),

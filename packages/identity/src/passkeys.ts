@@ -168,6 +168,18 @@ function sameRegistration(
   proposed: CredentialIndexRecord,
 ): boolean {
   return (
+    sameCredentialGeneration(current, proposed) &&
+    current.counter === proposed.counter &&
+    current.nextCounter === proposed.nextCounter &&
+    current.updatedAt === proposed.updatedAt
+  );
+}
+
+function sameCredentialGeneration(
+  current: CredentialIndexRecord,
+  proposed: CredentialIndexRecord,
+): boolean {
+  return (
     current.credentialHash === proposed.credentialHash &&
     current.credentialId === proposed.credentialId &&
     current.registrationId === proposed.registrationId &&
@@ -175,10 +187,8 @@ function sameRegistration(
     current.principalId === proposed.principalId &&
     current.principalHash === proposed.principalHash &&
     current.publicKey === proposed.publicKey &&
-    current.counter === proposed.counter &&
     current.label === proposed.label &&
     current.createdAt === proposed.createdAt &&
-    current.updatedAt === proposed.updatedAt &&
     current.transports.length === proposed.transports.length &&
     current.transports.every(
       (transport, index) => transport === proposed.transports[index],
@@ -186,9 +196,22 @@ function sameRegistration(
   );
 }
 
+function finalizedCounterTransition(
+  current: CredentialIndexRecord,
+  pending: CredentialIndexRecord,
+): boolean {
+  return (
+    current.state === "active" &&
+    sameCredentialGeneration(current, pending) &&
+    current.counter === pending.nextCounter &&
+    current.nextCounter === pending.nextCounter &&
+    current.updatedAt === pending.updatedAt
+  );
+}
+
 type RegistrationMaterial = Omit<
   CredentialIndexRecord,
-  "partition" | "id" | "registrationProofHash" | "state"
+  "partition" | "id" | "registrationProofHash" | "state" | "nextCounter"
 >;
 
 function registrationProofMaterial(material: RegistrationMaterial): string {
@@ -235,13 +258,21 @@ function sameCredentialBinding(
   index: CredentialIndexRecord,
 ): boolean {
   return (
+    sameCredentialMaterial(passkey, index) && passkey.counter === index.counter
+  );
+}
+
+function sameCredentialMaterial(
+  passkey: PasskeyRecord,
+  index: CredentialIndexRecord,
+): boolean {
+  return (
     passkey.credentialHash === index.credentialHash &&
     passkey.credentialId === index.credentialId &&
     passkey.registrationId === index.registrationId &&
     passkey.principalId === index.principalId &&
     passkey.principalHash === index.principalHash &&
     passkey.publicKey === index.publicKey &&
-    passkey.counter === index.counter &&
     passkey.label === index.label &&
     passkey.createdAt === index.createdAt &&
     passkey.transports.length === index.transports.length &&
@@ -350,6 +381,7 @@ export function createPasskeyService(
       !sameRegistrationProof(inserted.value, {
         ...credentialKey(material.credentialHash),
         ...material,
+        nextCounter: material.counter,
         registrationProofHash: proofHash,
         state: "reserved",
       })
@@ -521,6 +553,97 @@ export function createPasskeyService(
       }
       return null;
     }
+    if (index.state === "counter-pending") {
+      const current = await credentials.get(
+        credentialKey(index.credentialHash),
+      );
+      if (current !== null && finalizedCounterTransition(current, index)) {
+        return assertCredentialMirror(current);
+      }
+      if (
+        current === null ||
+        current.state !== "counter-pending" ||
+        !sameRegistration(current, index)
+      ) {
+        throw new IdentityError(
+          "conflict",
+          "Credential changed while it was being repaired.",
+        );
+      }
+      const key = passkeyKey(index.principalHash, index.credentialHash);
+      const mirrored = await passkeys.update(
+        key,
+        (passkey) => {
+          if (
+            passkey === null ||
+            passkey.state !== "active" ||
+            !sameCredentialMaterial(passkey, index) ||
+            (passkey.counter !== index.counter &&
+              passkey.counter !== index.nextCounter)
+          ) {
+            return { action: "keep" };
+          }
+          return passkey.counter === index.nextCounter
+            ? { action: "keep" }
+            : {
+                action: "write",
+                value: {
+                  ...passkey,
+                  counter: index.nextCounter,
+                  updatedAt: index.updatedAt,
+                  lastUsedAt: index.updatedAt,
+                },
+              };
+        },
+        { maxAttempts: 10 },
+      );
+      if (
+        mirrored.value === null ||
+        mirrored.value.state !== "active" ||
+        !sameCredentialMaterial(mirrored.value, index) ||
+        mirrored.value.counter !== index.nextCounter
+      ) {
+        throw new IdentityError(
+          "storage_corrupt",
+          "Stored credential binding is malformed.",
+        );
+      }
+      const finalized = await credentials.update(
+        credentialKey(index.credentialHash),
+        async (candidate) => {
+          if (candidate !== null) {
+            await assertCredentialOwner(candidate);
+          }
+          if (
+            candidate === null ||
+            candidate.state !== "counter-pending" ||
+            !sameRegistration(candidate, index)
+          ) {
+            return { action: "keep" };
+          }
+          return {
+            action: "write",
+            value: {
+              ...candidate,
+              state: "active",
+              counter: candidate.nextCounter,
+            },
+          };
+        },
+        { maxAttempts: 10 },
+      );
+      if (
+        finalized.value === null ||
+        !finalizedCounterTransition(finalized.value, index)
+      ) {
+        throw new IdentityError(
+          "conflict",
+          "Credential changed while it was being repaired.",
+        );
+      }
+      await assertCredentialMirror(finalized.value);
+      return mirrored.value;
+    }
     const current = await credentials.get(credentialKey(index.credentialHash));
     if (
       current === null ||
@@ -561,6 +684,7 @@ export function createPasskeyService(
     const proposed: CredentialIndexRecord = {
       ...key,
       ...material,
+      nextCounter: material.counter,
       registrationProofHash: proofHash,
       state: "reserved",
     };
@@ -809,7 +933,15 @@ export function createPasskeyService(
         "invalid_input",
       );
       const credentialDigest = await credentialHash(credentialId);
-      const index = await credentials.get(credentialKey(credentialDigest));
+      let index = await credentials.get(credentialKey(credentialDigest));
+      if (
+        index !== null &&
+        index.state === "counter-pending" &&
+        index.credentialId === credentialId
+      ) {
+        await repair(index);
+        index = await credentials.get(credentialKey(credentialDigest));
+      }
       if (
         index !== null &&
         index.state === "active" &&
@@ -877,7 +1009,15 @@ export function createPasskeyService(
           advanced = true;
           return {
             action: "write",
-            value: { ...current, counter: newCounter, updatedAt: now },
+            value:
+              current.counter === newCounter
+                ? { ...current, updatedAt: now }
+                : {
+                    ...current,
+                    state: "counter-pending",
+                    nextCounter: newCounter,
+                    updatedAt: now,
+                  },
           };
         },
         { maxAttempts: 10 },
@@ -885,28 +1025,30 @@ export function createPasskeyService(
       if (!advanced || !updated.written || updated.value === null) {
         return verificationFailed(claim);
       }
-      await passkeys.update(
-        passkeyKey(index.principalHash, credentialDigest),
-        (current) =>
-          current === null ||
-          current.state !== "active" ||
-          current.principalId !== index.principalId ||
-          current.principalHash !== index.principalHash ||
-          current.registrationId !== index.registrationId ||
-          !sameCredentialBinding(current, index) ||
-          current.counter > newCounter
-            ? { action: "keep" }
-            : {
-                action: "write",
-                value: {
-                  ...current,
-                  counter: newCounter,
-                  updatedAt: now,
-                  lastUsedAt: now,
+      if (updated.value.state === "counter-pending") {
+        await repair(updated.value);
+      } else {
+        await passkeys.update(
+          passkeyKey(index.principalHash, credentialDigest),
+          (current) =>
+            current === null ||
+            current.state !== "active" ||
+            current.principalId !== index.principalId ||
+            current.principalHash !== index.principalHash ||
+            current.registrationId !== index.registrationId ||
+            !sameCredentialBinding(current, index)
+              ? { action: "keep" }
+              : {
+                  action: "write",
+                  value: {
+                    ...current,
+                    updatedAt: now,
+                    lastUsedAt: now,
+                  },
                 },
-              },
-        { maxAttempts: 10 },
-      );
+          { maxAttempts: 10 },
+        );
+      }
       const confirmed = await credentials.get(credentialKey(credentialDigest));
       if (
         confirmed === null ||
@@ -949,6 +1091,15 @@ export function createPasskeyService(
       );
       const digest = await credentialHash(credentialId);
       const principalDigest = await principalHash(principalId);
+      const interrupted = await credentials.get(credentialKey(digest));
+      if (
+        interrupted?.state === "counter-pending" &&
+        interrupted.credentialId === credentialId &&
+        interrupted.principalId === principalId &&
+        interrupted.principalHash === principalDigest
+      ) {
+        await repair(interrupted);
+      }
       const now = timestampFromClock(options.clock).value;
       let revoked = false;
       const result = await credentials.update(
