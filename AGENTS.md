@@ -72,6 +72,7 @@ published from its protected signed tag through trusted-publisher OIDC. Its
 runtime and API contain the reviewed user/email-index, durable email-code,
 Mail, and passkey implementation. pegma.dev composes it in production with
 Sessions, Rate Limit, and `@pegma/authorization-identity@0.1.2`.
+The public API remains unstable while it is in the `0.x` line.
 
 Normal releases use the protected signed annotated `vX.Y.Z` tag and GitHub
 release workflow described in `docs/RELEASING.md`. Never publish a locally
