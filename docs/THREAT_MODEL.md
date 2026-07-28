@@ -36,7 +36,9 @@ The primary boundaries are:
    HTTP and rate-limit policy onto this library. Host configuration is trusted
    but validated at runtime where practical.
 3. `@simplewebauthn/server` parses and cryptographically verifies WebAuthn
-   responses. Its exact reviewed version is part of this package's runtime
+   responses. Exact-reviewed `unorm`, `unicode-case-folding`, and `tr46` data
+   normalize the fixed email repertoire without relying on runtime Unicode or
+   IDNA versions. These exact versions are part of the package's runtime
    security boundary.
 4. `@pegma/storage-core` and its adapter persist flat records. Storage content
    is not trusted to be well formed: decoding and state transitions fail
@@ -63,7 +65,8 @@ Security invariants:
 - `PrincipalId`, not email, is the authoritative identity subject.
 - Exactly one normalization function produces every email lookup value.
   NFKC-compatible, full Unicode default-case-fold equivalent, and IDNA
-  U-label/A-label domain inputs collide structurally.
+  U-label/A-label domain inputs inside a fixed repertoire collide
+  structurally. Inputs outside that repertoire fail closed.
 - User creation cannot expose two active principals for one normalized email,
   including during crashes and races. Recovery uses an explicit
   reserve/prepare/commit/activate/repair protocol.
@@ -74,7 +77,9 @@ Security invariants:
   scoped to configured RP IDs and origins, and support multiple credentials
   per principal. Every credential-index trust boundary recomputes
   `principalHash` from `principalId` before verification, mutation, repair, or
-  claims issuance.
+  claims issuance and cross-checks the independently stored active passkey
+  mirror's owner, credential identity, generation, public key, transports,
+  label, creation time, and counter.
 - Challenges are unpredictable, hashed at rest, short-lived, single-use,
   attempt-bounded, and version-conditionally swept through a caller-supplied
   durable lazy retention index. A sweep pulls and inspects at most its limit;
@@ -82,9 +87,9 @@ Security invariants:
   carries a trusted host-issued cursor and immutable retention-id/handle
   locator from record metadata separately from its untrusted payload, so
   malformed payloads can be advanced and valid pointers can be repaired from
-  authoritative rows without orphaning them. Candidate enumeration uses a
-  separately stored trusted expiry field and returns due entries only, so live
-  prefixes cannot starve expired work across bounded sweeps.
+  authoritative rows without orphaning them. Candidate enumeration durably
+  advances a fair scan position independently of expiry metadata, so early or
+  late corruption and live prefixes cannot starve expired work.
 - A positive nonzero signature counter must strictly increase. A counter may
   remain zero only when both stored and newly reported values are zero.
 - Raw token-shaped values, future one-time codes, and challenge verification
@@ -104,10 +109,11 @@ implementation, and a storage adapter conforming to `@pegma/storage-core`.
 ## Attack Surface, Mitigations, and Attacker Stories
 
 Email lookup is exposed to normalization confusion and concurrency. NFKC
-normalization, exact-pinned full Unicode default case folding, web-standard
-IDNA conversion to an ASCII A-label domain, control rejection, bounded input,
-a digest-derived backend-safe key, and `insertIfAbsent` prevent
-case/Unicode/IDNA aliases and storage-key metacharacters from creating
+normalization, exact-pinned full Unicode default case folding, exact-pinned
+TR46 conversion to an ASCII A-label domain, a deliberately fixed supported
+repertoire, control rejection, bounded input, a digest-derived backend-safe
+key, and `insertIfAbsent` prevent runtime Unicode/IDNA table drift,
+case/Unicode/IDNA aliases, and storage-key metacharacters from creating
 duplicate accounts.
 Cross-collection crashes are expected, so intermediate states are durable and
 repairable rather than treated as exceptional.
@@ -120,14 +126,17 @@ before its authoritative challenge, so crashes can create stale references
 but not unsweepable rows. Retention adapters idempotently upsert by retention
 identity, return one stable unique cursor, and derive candidate cursors from
 record metadata together with an immutable retention-id/handle locator rather
-than trusting corruptible payload fields. A separately stored trusted expiry
-ordering field restricts enumeration to due entries, preventing stable or
-continuously refilled live prefixes from starving expired work. Sweep uses
-that locator to recover the authoritative challenge, repairs a fully malformed
-or substituted payload before settling its cursor, and discards an entry only
-when the trusted locator has no row. One poisoned front entry therefore cannot
-starve the bounded scan or orphan a reachable challenge. Authentication uses
-discoverable credentials and does not accept an email identity hint.
+than trusting corruptible payload fields. Candidate enumeration durably
+advances a fair scan cursor independently of separately stored expiry
+metadata, preventing early or late expiry corruption and continuously
+refilled live prefixes from hiding expired work. Sweep uses the locator to
+recover the authoritative challenge and re-tracks every surfaced row,
+including non-removable live rows, before advancing. This repairs payload and
+expiry metadata; repair failure retains the pointer. An entry is discarded
+only when the trusted locator has no row. One poisoned front entry therefore
+cannot starve the bounded scan or orphan a reachable challenge.
+Authentication uses discoverable credentials and does not accept an email
+identity hint.
 Verification pins the expected RP ID, allowed origin, challenge digest, and
 required user verification. Credential IDs are structurally unique and
 signature-counter transitions use optimistic concurrency. A re-registration
@@ -147,9 +156,13 @@ state.
 Storage poisoning can target codecs, sweep key reconstruction, or state
 machines. Codecs validate types, exact enum values, timestamp shape, hashes,
 and identity relationships. Credential index reads recompute the owner digest
-before any challenge claim, signature verification, repair, mutation, or
-claims lookup. Sweeps delete only keys reconstructed from valid authoritative
-records and pair each with the version returned for that record.
+and require an exact independently stored passkey binding before any challenge
+claim, signature verification, repair, mutation, or claims lookup. The binding
+is repeated inside counter/revocation mutations and immediately before claims
+issuance, so substituting both owner fields cannot attach an attacker's
+credential material to a victim. Sweeps delete only keys reconstructed from
+valid authoritative records and pair each with the version returned for that
+record.
 Retention payloads never provide lookup or removal authority: their separate
 trusted cursor and immutable locator advance missing rows, while every
 existing challenge is repaired before its old cursor can be settled, and the

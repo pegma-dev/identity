@@ -178,6 +178,27 @@ function sameRegistration(
   );
 }
 
+function sameCredentialBinding(
+  passkey: PasskeyRecord,
+  index: CredentialIndexRecord,
+): boolean {
+  return (
+    passkey.credentialHash === index.credentialHash &&
+    passkey.credentialId === index.credentialId &&
+    passkey.registrationId === index.registrationId &&
+    passkey.principalId === index.principalId &&
+    passkey.principalHash === index.principalHash &&
+    passkey.publicKey === index.publicKey &&
+    passkey.counter === index.counter &&
+    passkey.label === index.label &&
+    passkey.createdAt === index.createdAt &&
+    passkey.transports.length === index.transports.length &&
+    passkey.transports.every(
+      (transport, position) => transport === index.transports[position],
+    )
+  );
+}
+
 async function enforce(limiter: RateLimiter, key: string): Promise<void> {
   let decision;
   try {
@@ -234,6 +255,26 @@ export function createPasskeyService(
   const passkeys = options.store.collection(passkeysCollection);
   const credentials = options.store.collection(credentialIndexesCollection);
 
+  async function assertCredentialMirror(
+    index: CredentialIndexRecord,
+  ): Promise<PasskeyRecord> {
+    await assertCredentialOwner(index);
+    const passkey = await passkeys.get(
+      passkeyKey(index.principalHash, index.credentialHash),
+    );
+    if (
+      passkey === null ||
+      passkey.state !== "active" ||
+      !sameCredentialBinding(passkey, index)
+    ) {
+      throw new IdentityError(
+        "storage_corrupt",
+        "Stored credential binding is malformed.",
+      );
+    }
+    return passkey;
+  }
+
   async function ensurePasskey(
     index: CredentialIndexRecord,
   ): Promise<PasskeyRecord> {
@@ -251,7 +292,8 @@ export function createPasskeyService(
         }
         if (
           current?.state === "active" &&
-          current.registrationId === index.registrationId
+          current.registrationId === index.registrationId &&
+          sameCredentialBinding(current, index)
         ) {
           return { action: "keep" };
         }
@@ -276,7 +318,10 @@ export function createPasskeyService(
           transports: index.transports,
           label: index.label,
           state: "active",
-          createdAt: current?.createdAt ?? index.createdAt,
+          createdAt:
+            current?.registrationId === index.registrationId
+              ? current.createdAt
+              : index.createdAt,
           updatedAt: index.updatedAt,
           lastUsedAt: null,
         };
@@ -290,6 +335,7 @@ export function createPasskeyService(
       result.value.principalHash !== index.principalHash ||
       result.value.credentialId !== index.credentialId ||
       result.value.registrationId !== index.registrationId ||
+      !sameCredentialBinding(result.value, index) ||
       result.value.state !== "active"
     ) {
       throw new IdentityError(
@@ -343,6 +389,7 @@ export function createPasskeyService(
 
   async function repair(
     index: CredentialIndexRecord,
+    allowMissingMirror = false,
   ): Promise<PasskeyRecord | null> {
     await assertCredentialOwner(index);
     if (index.state === "revoked") {
@@ -372,6 +419,24 @@ export function createPasskeyService(
         );
       }
       return null;
+    }
+    if (!allowMissingMirror) {
+      const current = await credentials.get(
+        credentialKey(index.credentialHash),
+      );
+      if (
+        current === null ||
+        current.state !== index.state ||
+        current.registrationId !== index.registrationId ||
+        current.principalId !== index.principalId ||
+        current.principalHash !== index.principalHash
+      ) {
+        throw new IdentityError(
+          "conflict",
+          "Credential changed while it was being repaired.",
+        );
+      }
+      await assertCredentialMirror(index);
     }
     const passkey = await ensurePasskey(index);
     await activateCredential(index);
@@ -431,7 +496,7 @@ export function createPasskeyService(
         "Another credential registration won the race.",
       );
     }
-    const repaired = await repair(index);
+    const repaired = await repair(index, true);
     if (repaired === null) {
       throw new IdentityError(
         "invalid_state",
@@ -633,8 +698,12 @@ export function createPasskeyService(
       );
       const credentialDigest = await credentialHash(credentialId);
       const index = await credentials.get(credentialKey(credentialDigest));
-      if (index !== null) {
-        await assertCredentialOwner(index);
+      if (
+        index !== null &&
+        index.state === "active" &&
+        index.credentialId === credentialId
+      ) {
+        await assertCredentialMirror(index);
       }
       const claim = await options.challengeService.claimChallenge(
         challengeHandle,
@@ -679,8 +748,8 @@ export function createPasskeyService(
       const updated = await credentials.update(
         credentialKey(credentialDigest),
         async (current) => {
-          if (current !== null) {
-            await assertCredentialOwner(current);
+          if (current?.state === "active") {
+            await assertCredentialMirror(current);
           }
           if (
             current === null ||
@@ -712,6 +781,7 @@ export function createPasskeyService(
           current.principalId !== index.principalId ||
           current.principalHash !== index.principalHash ||
           current.registrationId !== index.registrationId ||
+          !sameCredentialBinding(current, index) ||
           current.counter > newCounter
             ? { action: "keep" }
             : {
@@ -725,8 +795,20 @@ export function createPasskeyService(
               },
         { maxAttempts: 10 },
       );
+      const confirmed = await credentials.get(credentialKey(credentialDigest));
+      if (
+        confirmed === null ||
+        confirmed.state !== "active" ||
+        confirmed.principalId !== index.principalId ||
+        confirmed.principalHash !== index.principalHash ||
+        confirmed.registrationId !== index.registrationId ||
+        confirmed.counter !== newCounter
+      ) {
+        return verificationFailed(claim);
+      }
+      await assertCredentialMirror(confirmed);
       await options.challengeService.consumeClaim(claim);
-      return options.users.claimsFor(index.principalId);
+      return options.users.claimsFor(confirmed.principalId);
     },
 
     async listPasskeys(principalInput) {
@@ -760,8 +842,8 @@ export function createPasskeyService(
       const result = await credentials.update(
         credentialKey(digest),
         async (current) => {
-          if (current !== null) {
-            await assertCredentialOwner(current);
+          if (current?.state === "active") {
+            await assertCredentialMirror(current);
           }
           if (
             current === null ||

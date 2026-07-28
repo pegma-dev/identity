@@ -23,7 +23,9 @@ const REQUIRED_DEPENDENCIES = {
   "@pegma/spine": "0.1.1",
   "@pegma/storage-core": "0.3.0",
   "@simplewebauthn/server": "13.3.2",
+  tr46: "6.0.0",
   "unicode-case-folding": "1.1.1",
+  unorm: "1.6.0",
 };
 const ALLOWED_STATIC_FILES = new Set(["LICENSE", "README.md", "package.json"]);
 
@@ -271,7 +273,11 @@ async function smokeImport(tarball) {
         "--input-type=module",
         "--eval",
         `const module = await import(${JSON.stringify(PACKAGE_NAME)});
-         if (typeof module.createIdentity !== "function") process.exit(1);`,
+         if (typeof module.createIdentity !== "function") process.exit(1);
+         if (module.normalizeEmail("xs@example.test") !== "xs@example.test") process.exit(1);
+         let rejected = false;
+         try { module.normalizeEmail("x\\uA7F1@example.test"); } catch { rejected = true; }
+         if (!rejected) process.exit(1);`,
       ],
       { cwd: workspace },
     );

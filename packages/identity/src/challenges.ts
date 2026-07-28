@@ -66,14 +66,15 @@ export interface ChallengeRetentionCandidate {
  *
  * `track()` is an idempotent upsert and returns the same stable, unique cursor
  * for every reference with the same retention id.
- * `candidates(limit, expiresThrough)` must use a trusted, separately stored
- * expiry ordering key written by `track()`, skip entries later than
- * `expiresThrough`, construct each cursor and immutable locator from trusted
- * record metadata, keep them separate from the untrusted stored reference
- * payload, and not pre-materialize more than `limit` candidates. This due-only
- * contract prevents a stable prefix of live entries from starving expired
- * entries across repeated bounded sweeps. Identity calls `next()` at most
- * `limit` times and never enumerates the challenge collection.
+ * `candidates(limit)` must durably advance a fair scan position before
+ * yielding. Every retained entry must become visible independent of its
+ * expiry-order metadata, and newly tracked entries must not reset or jump the
+ * scan position. This makes both early and late corruption of an expiry index
+ * self-healing when Identity re-tracks the authoritative reference. Each
+ * cursor and immutable locator comes from trusted record metadata, remains
+ * separate from the untrusted stored reference payload, and the adapter must
+ * not pre-materialize more than `limit` candidates. Identity calls `next()`
+ * at most `limit` times and never enumerates the challenge collection.
  * `complete()` removes the entry named by the opaque cursor even when its
  * payload is malformed.
  */
@@ -81,10 +82,7 @@ export interface ChallengeRetention {
   track(
     reference: ChallengeRetentionReference,
   ): Promise<ChallengeRetentionCursor>;
-  candidates(
-    limit: number,
-    expiresThrough: IsoTimestamp,
-  ): AsyncIterable<ChallengeRetentionCandidate>;
+  candidates(limit: number): AsyncIterable<ChallengeRetentionCandidate>;
   complete(cursor: ChallengeRetentionCursor): Promise<void>;
 }
 
@@ -98,6 +96,7 @@ export function createMemoryChallengeRetention(): ChallengeRetention {
       readonly expiresAt: IsoTimestamp;
     }
   >();
+  let nextCursor: string | null = null;
   return {
     async track(reference) {
       references.set(
@@ -113,13 +112,23 @@ export function createMemoryChallengeRetention(): ChallengeRetention {
       );
       return reference.retentionId;
     },
-    async *candidates(limit, expiresThrough) {
+    async *candidates(limit) {
+      const cursors = [...references.keys()];
+      if (cursors.length === 0) {
+        return;
+      }
+      let position =
+        nextCursor === null ? 0 : Math.max(0, cursors.indexOf(nextCursor));
       let yielded = 0;
-      for (const [cursor, entry] of references) {
-        if (yielded >= limit) {
+      while (yielded < limit && yielded < cursors.length) {
+        const cursor = cursors[position];
+        if (cursor === undefined) {
           break;
         }
-        if (entry.expiresAt > expiresThrough) {
+        position = (position + 1) % cursors.length;
+        nextCursor = cursors[position] ?? null;
+        const entry = references.get(cursor);
+        if (entry === undefined) {
           continue;
         }
         yielded += 1;
@@ -131,6 +140,14 @@ export function createMemoryChallengeRetention(): ChallengeRetention {
       }
     },
     async complete(cursor) {
+      if (nextCursor === cursor) {
+        const cursors = [...references.keys()];
+        const position = cursors.indexOf(cursor);
+        nextCursor =
+          position === -1 || cursors.length <= 1
+            ? null
+            : (cursors[(position + 1) % cursors.length] ?? null);
+      }
       references.delete(cursor);
     },
   };
@@ -596,11 +613,9 @@ export function createChallengeService(
       ) {
         throw new IdentityError("invalid_input", "Sweep limit is invalid.");
       }
-      const { value: nowValue, milliseconds: now } = timestampFromClock(
-        options.clock,
-      );
+      const now = timestampFromClock(options.clock).milliseconds;
       const iterator = options.retention
-        .candidates(limitInput, nowValue)
+        .candidates(limitInput)
         [Symbol.asyncIterator]();
       let pulled = 0;
       let inspected = 0;
@@ -685,10 +700,6 @@ export function createChallengeService(
             Date.parse(row.value.expiresAt) <= now ||
             row.value.state === "consumed" ||
             row.value.state === "failed";
-          if (!removable) {
-            retryNeeded = true;
-            continue;
-          }
           if (!cursorConfirmed) {
             try {
               authoritativeCursor = retentionCursor(
@@ -708,6 +719,10 @@ export function createChallengeService(
               retryNeeded = true;
               continue;
             }
+          }
+          if (!removable) {
+            retryNeeded = true;
+            continue;
           }
           const removed = await collection.deleteIfUnchanged(
             challengeKey(candidate.locator.handleHash),

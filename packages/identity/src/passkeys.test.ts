@@ -109,7 +109,11 @@ import {
   type ChallengeRetentionLocator,
   type ChallengeRetentionReference,
 } from "./index.js";
-import { challengeHandleHash, credentialHash } from "./crypto.js";
+import {
+  challengeHandleHash,
+  credentialHash,
+  principalHash,
+} from "./crypto.js";
 import { validCounterTransition } from "./passkeys.js";
 import {
   challengesCollection,
@@ -216,6 +220,7 @@ function observeStore(inner: Store) {
 
 interface InspectableRetention extends ChallengeRetention {
   corrupt(cursor: string, reference: unknown): Promise<void>;
+  corruptDue(cursor: string, expiresAt: string): Promise<void>;
   inject(
     cursor: string,
     locator: ChallengeRetentionLocator,
@@ -223,6 +228,7 @@ interface InspectableRetention extends ChallengeRetention {
   ): Promise<void>;
   failNextTrack(): void;
   peek(cursor: string): Promise<unknown | null>;
+  peekDue(cursor: string): Promise<string | null>;
   cursors(): readonly string[];
 }
 
@@ -244,6 +250,7 @@ function createInspectableMemoryRetention(): InspectableRetention {
     }
   >();
   const order: string[] = [];
+  let nextCursor: string | null = null;
   let rejectNextTrack = false;
   return {
     async track(reference) {
@@ -264,20 +271,23 @@ function createInspectableMemoryRetention(): InspectableRetention {
       });
       return reference.retentionId;
     },
-    async *candidates(limit, expiresThrough) {
+    async *candidates(limit) {
+      const cursors = order.filter((cursor) => references.has(cursor));
+      if (cursors.length === 0) {
+        return;
+      }
+      let position =
+        nextCursor === null ? 0 : Math.max(0, cursors.indexOf(nextCursor));
       let yielded = 0;
-      for (const cursor of order) {
-        if (yielded >= limit) {
+      while (yielded < limit && yielded < cursors.length) {
+        const cursor = cursors[position];
+        if (cursor === undefined) {
           break;
         }
-        if (!references.has(cursor)) {
-          continue;
-        }
+        position = (position + 1) % cursors.length;
+        nextCursor = cursors[position] ?? null;
         const entry = references.get(cursor);
         if (entry === undefined) {
-          continue;
-        }
-        if (entry.expiresAt > expiresThrough) {
           continue;
         }
         yielded += 1;
@@ -289,6 +299,13 @@ function createInspectableMemoryRetention(): InspectableRetention {
       }
     },
     async complete(cursor) {
+      if (nextCursor === cursor) {
+        const position = order.indexOf(cursor);
+        nextCursor =
+          order.length <= 1 || position === -1
+            ? null
+            : (order[(position + 1) % order.length] ?? null);
+      }
       references.delete(cursor);
       const index = order.indexOf(cursor);
       if (index !== -1) {
@@ -305,6 +322,13 @@ function createInspectableMemoryRetention(): InspectableRetention {
       }
       references.set(cursor, { ...entry, reference });
     },
+    async corruptDue(cursor, expiresAt) {
+      const entry = references.get(cursor);
+      if (entry === undefined) {
+        throw new Error("retention cursor was not found");
+      }
+      references.set(cursor, { ...entry, expiresAt });
+    },
     async inject(cursor, locator, reference) {
       if (!references.has(cursor)) {
         order.unshift(cursor);
@@ -320,6 +344,9 @@ function createInspectableMemoryRetention(): InspectableRetention {
     },
     async peek(cursor) {
       return references.get(cursor)?.reference ?? null;
+    },
+    async peekDue(cursor) {
+      return references.get(cursor)?.expiresAt ?? null;
     },
     cursors() {
       return [...order];
@@ -398,6 +425,7 @@ function createStoredRetention(store: Store): InspectableRetention {
   const records = store.collection(storedRetentionCollection);
   const order: string[] = [];
   const trustedExpiry = new Map<string, string>();
+  let nextCursor: string | null = null;
   let rejectNextTrack = false;
   const write = async (
     locator: ChallengeRetentionLocator,
@@ -429,22 +457,24 @@ function createStoredRetention(store: Store): InspectableRetention {
       await write(locator, reference, reference.expiresAt);
       return cursor;
     },
-    async *candidates(limit, expiresThrough) {
+    async *candidates(limit) {
+      const cursors = order.filter((cursor) => trustedExpiry.has(cursor));
+      if (cursors.length === 0) {
+        return;
+      }
+      let position =
+        nextCursor === null ? 0 : Math.max(0, cursors.indexOf(nextCursor));
       let yielded = 0;
-      for (const cursor of order) {
-        if (yielded >= limit) {
+      while (yielded < limit && yielded < cursors.length) {
+        const cursor = cursors[position];
+        if (cursor === undefined) {
           break;
         }
-        const dueAt = trustedExpiry.get(cursor);
-        if (dueAt === undefined || dueAt > expiresThrough) {
-          continue;
-        }
+        position = (position + 1) % cursors.length;
+        nextCursor = cursors[position] ?? null;
         const locator = storedRetentionLocator(cursor);
         const record = await records.get(storedRetentionKey(locator));
         if (record === null) {
-          continue;
-        }
-        if (record.expiresAt > expiresThrough) {
           continue;
         }
         yielded += 1;
@@ -463,6 +493,13 @@ function createStoredRetention(store: Store): InspectableRetention {
       }
     },
     async complete(cursor) {
+      if (nextCursor === cursor) {
+        const position = order.indexOf(cursor);
+        nextCursor =
+          order.length <= 1 || position === -1
+            ? null
+            : (order[(position + 1) % order.length] ?? null);
+      }
       await records.delete(storedRetentionKey(storedRetentionLocator(cursor)));
       trustedExpiry.delete(cursor);
       const index = order.indexOf(cursor);
@@ -477,6 +514,15 @@ function createStoredRetention(store: Store): InspectableRetention {
         throw new Error("retention cursor was not found");
       }
       await write(locator, reference, record.expiresAt);
+    },
+    async corruptDue(cursor, expiresAt) {
+      const locator = storedRetentionLocator(cursor);
+      const record = await records.get(storedRetentionKey(locator));
+      if (record === null) {
+        throw new Error("retention cursor was not found");
+      }
+      trustedExpiry.set(cursor, expiresAt);
+      await write(locator, JSON.parse(record.payload) as unknown, expiresAt);
     },
     async inject(cursor, locator, reference) {
       if (cursor !== storedRetentionCursor(locator)) {
@@ -496,6 +542,11 @@ function createStoredRetention(store: Store): InspectableRetention {
         storedRetentionKey(storedRetentionLocator(cursor)),
       );
       return record === null ? null : (JSON.parse(record.payload) as unknown);
+    },
+    async peekDue(cursor) {
+      const locator = storedRetentionLocator(cursor);
+      const record = await records.get(storedRetentionKey(locator));
+      return record?.expiresAt ?? null;
     },
     cursors() {
       return [...order];
@@ -791,6 +842,77 @@ describe("passkey ceremonies", () => {
     expect(getters).toBe(0);
     expect(ceremony.authenticationVerifications).toBe(0);
   });
+
+  it.each([
+    ["memory store", createMemoryStore],
+    ["Azurite", createAzuriteStore],
+  ] as const)(
+    "rejects a substituted credential owner pair before verification or mutation over %s",
+    async (_name, makeStore) => {
+      const inner = makeStore();
+      const observed = observeStore(inner);
+      const identity = service(observed.store);
+      const attackerPrincipalId = await provision(identity);
+      const victimPrincipalId = "principal-passkeys-victim" as PrincipalId;
+      await identity.provisionVerifiedUser({
+        principalId: victimPrincipalId,
+        email: "victim@example.test",
+      });
+      const registration = await identity.beginPasskeyRegistration(
+        attackerPrincipalId,
+        "request-registration",
+      );
+      await identity.finishPasskeyRegistration({
+        principalId: attackerPrincipalId,
+        challengeHandle: registration.challengeHandle,
+        label: "Attacker key",
+        response: registrationResponse(),
+      });
+
+      const credentialDigest = await credentialHash(ceremony.credentialId);
+      const credentials = inner.collection(credentialIndexesCollection);
+      const key = {
+        partition: `credential-${credentialDigest.slice(0, 16)}`,
+        id: credentialDigest,
+      };
+      const original = await credentials.get(key);
+      if (original === null) {
+        throw new Error("expected a credential index");
+      }
+      await credentials.put({
+        ...original,
+        principalId: victimPrincipalId,
+        principalHash: await principalHash(victimPrincipalId),
+      });
+      const authentication = await identity.beginPasskeyAuthentication(
+        "request-authentication",
+      );
+      observed.arm();
+
+      await expect(
+        identity.finishPasskeyAuthentication({
+          challengeHandle: authentication.challengeHandle,
+          response: authenticationResponse(),
+        }),
+      ).rejects.toMatchObject({ code: "storage_corrupt" });
+      expect(ceremony.authenticationVerifications).toBe(0);
+      expect(observed.userReads()).toBe(0);
+      expect(observed.mutations()).toBe(0);
+      const challengeDigest = await challengeHandleHash(
+        authentication.challengeHandle,
+      );
+      await expect(
+        inner
+          .collection(challengesCollection)
+          .get({ partition: "challenges", id: challengeDigest }),
+      ).resolves.toMatchObject({ state: "pending", attempts: 0 });
+      await expect(credentials.get(key)).resolves.toMatchObject({
+        principalId: victimPrincipalId,
+        counter: original.counter,
+        publicKey: original.publicKey,
+      });
+    },
+  );
 
   it.each([
     ["memory store", createMemoryStore],
@@ -1239,7 +1361,7 @@ describe("challenge controls", () => {
   );
 
   it.each(retentionHarnesses)(
-    "does not let a newest-first live prefix starve an expired $name entry",
+    "repairs an early-due live $name entry without starving older expired work",
     async ({ create }) => {
       let now = "2026-07-27T12:00:00.000Z";
       const { store, retention } = create();
@@ -1253,7 +1375,24 @@ describe("challenge controls", () => {
       const expiredCursors = [...retention.cursors()];
 
       now = "2026-07-27T12:06:00.000Z";
-      for (const key of ["live-one", "live-two", "live-three"]) {
+      await identity.beginPasskeyAuthentication("live-one");
+      const earlyDueCursor = retention.cursors()[0];
+      if (earlyDueCursor === undefined) {
+        throw new Error("expected a live retention cursor");
+      }
+      await retention.corruptDue(earlyDueCursor, "2026-07-27T12:01:00.000Z");
+      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
+        pulled: 1,
+        inspected: 1,
+        deleted: 0,
+        completed: 0,
+        hasMore: true,
+      });
+      await expect(retention.peekDue(earlyDueCursor)).resolves.toBe(
+        "2026-07-27T12:11:00.000Z",
+      );
+
+      for (const key of ["live-two", "live-three", "live-four"]) {
         // The adapter is newest-first, and every pass adds another live entry
         // ahead of the remaining expired work.
         await identity.beginPasskeyAuthentication(key);
@@ -1270,7 +1409,76 @@ describe("challenge controls", () => {
           expect(retention.peek(cursor)).resolves.toBeNull(),
         ),
       );
-      expect(retention.cursors()).toHaveLength(3);
+      expect(retention.cursors()).toHaveLength(4);
+    },
+  );
+
+  it.each(retentionHarnesses)(
+    "audits past late-due corruption and reaches an expired $name entry",
+    async ({ create }) => {
+      let now = "2026-07-27T12:00:00.000Z";
+      const { store, retention } = create();
+      const identity = service(store, {
+        clock: { now: () => now },
+        challengeRetention: retention,
+      });
+      await identity.beginPasskeyAuthentication("expired");
+      const expiredCursor = retention.cursors()[0];
+      if (expiredCursor === undefined) {
+        throw new Error("expected an expired retention cursor");
+      }
+      await retention.corruptDue(expiredCursor, "2099-01-01T00:00:00.000Z");
+
+      now = "2026-07-27T12:06:00.000Z";
+      await identity.beginPasskeyAuthentication("live-one");
+      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
+        pulled: 1,
+        inspected: 1,
+        deleted: 0,
+      });
+      await identity.beginPasskeyAuthentication("live-two");
+      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
+        pulled: 1,
+        inspected: 1,
+        deleted: 1,
+        completed: 1,
+      });
+      await expect(retention.peek(expiredCursor)).resolves.toBeNull();
+    },
+  );
+
+  it.each(retentionHarnesses)(
+    "retains a live $name pointer when early-due repair fails",
+    async ({ create }) => {
+      const { store, retention } = create();
+      const identity = service(store, {
+        clock: { now: () => "2026-07-27T12:00:00.000Z" },
+        challengeRetention: retention,
+      });
+      await identity.beginPasskeyAuthentication("live");
+      const cursor = retention.cursors()[0];
+      if (cursor === undefined) {
+        throw new Error("expected a live retention cursor");
+      }
+      await retention.corruptDue(cursor, "1970-01-01T00:00:00.000Z");
+      retention.failNextTrack();
+
+      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
+        pulled: 1,
+        inspected: 1,
+        deleted: 0,
+        completed: 0,
+        hasMore: true,
+      });
+      await expect(retention.peek(cursor)).resolves.not.toBeNull();
+      await expect(retention.peekDue(cursor)).resolves.toBe(
+        "1970-01-01T00:00:00.000Z",
+      );
+
+      await identity.sweepChallenges(1);
+      await expect(retention.peekDue(cursor)).resolves.toBe(
+        "2026-07-27T12:05:00.000Z",
+      );
     },
   );
 

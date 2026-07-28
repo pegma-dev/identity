@@ -128,6 +128,14 @@ describe("canonical email normalization", () => {
     );
   });
 
+  it("fails closed on normalization and IDNA code points outside the pinned repertoire", () => {
+    expect(normalizeEmail("xs@example.test")).toBe("xs@example.test");
+    expect(() => normalizeEmail("x\uA7F1@example.test")).toThrow(IdentityError);
+    expect(() => normalizeEmail("person@x\uA7F1.example")).toThrow(
+      IdentityError,
+    );
+  });
+
   it.each([
     "a\u0000@example.test",
     "a\u001F@example.test",

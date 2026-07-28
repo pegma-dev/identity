@@ -169,9 +169,9 @@ breach; it gets the ceremony that deserves.
 One package: `packages/identity` publishing `@pegma/identity`.
 Dependencies: exact `@pegma/spine@0.1.1`,
 `@pegma/storage-core@0.3.0`, `@pegma/rate-limit@0.1.0`, and
-`@simplewebauthn/server@13.3.2`, and `unicode-case-folding@1.1.1`.
-Framework-free flows are functions the host's HTTP layer calls, same posture
-as every Pegma component.
+`@simplewebauthn/server@13.3.2`, `unicode-case-folding@1.1.1`,
+`unorm@1.6.0`, and `tr46@6.0.0`. Framework-free flows are functions the host's
+HTTP layer calls, same posture as every Pegma component.
 
 ## Delivery phases
 

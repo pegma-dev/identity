@@ -1,3 +1,5 @@
+import { toASCII } from "tr46";
+import unorm from "unorm";
 import { caseFold } from "unicode-case-folding";
 
 import { IdentityError } from "./errors.js";
@@ -5,8 +7,30 @@ import { assertBoundedString } from "./validation.js";
 
 const FORBIDDEN =
   /[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/u;
-const DEFAULT_IGNORABLE = /\p{Default_Ignorable_Code_Point}/gu;
+const DEFAULT_IGNORABLE = /[\u00AD\u034F]/gu;
 const ASCII_DOMAIN_LABEL = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/u;
+
+function inPinnedRepertoire(codePoint: number): boolean {
+  return (
+    (codePoint >= 0x20 && codePoint <= 0x7e) ||
+    (codePoint >= 0xa0 && codePoint <= 0x24f) ||
+    (codePoint >= 0x300 && codePoint <= 0x52f) ||
+    (codePoint >= 0x1f00 && codePoint <= 0x1fff) ||
+    (codePoint >= 0xff01 && codePoint <= 0xff5e)
+  );
+}
+
+function pinnedNfkcCaseFold(value: string): string {
+  for (const symbol of value) {
+    const codePoint = symbol.codePointAt(0);
+    if (codePoint === undefined || !inPinnedRepertoire(codePoint)) {
+      throw new IdentityError("invalid_input", "Email is invalid.");
+    }
+  }
+  return unorm
+    .nfkc(caseFold(unorm.nfkc(value)).replace(DEFAULT_IGNORABLE, ""))
+    .trim();
+}
 
 function canonicalDomain(value: string): string {
   if (
@@ -16,21 +40,20 @@ function canonicalDomain(value: string): string {
   ) {
     throw new IdentityError("invalid_input", "Email is invalid.");
   }
-  let hostname: string;
+  let hostname: string | undefined;
   try {
-    const url = new URL(`https://${value}`);
-    if (
-      url.username !== "" ||
-      url.password !== "" ||
-      url.port !== "" ||
-      url.pathname !== "/" ||
-      url.search !== "" ||
-      url.hash !== ""
-    ) {
-      throw new Error("domain was not an origin");
-    }
-    hostname = url.hostname.toLowerCase();
+    hostname = toASCII(value, {
+      checkBidi: true,
+      checkHyphens: true,
+      checkJoiners: true,
+      transitionalProcessing: false,
+      useSTD3ASCIIRules: true,
+      verifyDNSLength: true,
+    })?.toLowerCase();
   } catch {
+    throw new IdentityError("invalid_input", "Email is invalid.");
+  }
+  if (hostname === undefined) {
     throw new IdentityError("invalid_input", "Email is invalid.");
   }
   const labels = hostname.split(".");
@@ -63,10 +86,7 @@ export function normalizeEmail(value: unknown): string {
   if (FORBIDDEN.test(input)) {
     throw new IdentityError("invalid_input", "Email is invalid.");
   }
-  const normalized = caseFold(input.normalize("NFKC"))
-    .replace(DEFAULT_IGNORABLE, "")
-    .trim()
-    .normalize("NFKC");
+  const normalized = pinnedNfkcCaseFold(input);
   if (
     normalized.length === 0 ||
     FORBIDDEN.test(normalized) ||
