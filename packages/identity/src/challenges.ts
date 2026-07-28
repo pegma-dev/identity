@@ -39,6 +39,11 @@ export interface ChallengeRetentionReference {
   readonly expiresAt: IsoTimestamp;
 }
 
+export interface ChallengeRetentionLocator {
+  readonly retentionId: string;
+  readonly handleHash: string;
+}
+
 export type ChallengeRetentionCursor = string;
 
 export interface ChallengeRetentionCandidate {
@@ -47,6 +52,11 @@ export interface ChallengeRetentionCandidate {
    * metadata, never from the possibly corrupt reference payload.
    */
   readonly cursor: ChallengeRetentionCursor;
+  /**
+   * Immutable identity constructed from retention-record metadata, never from
+   * the possibly corrupt reference payload.
+   */
+  readonly locator: ChallengeRetentionLocator;
   /** Untrusted stored payload; Identity validates it without invoking getters. */
   readonly reference: unknown;
 }
@@ -56,11 +66,12 @@ export interface ChallengeRetentionCandidate {
  *
  * `track()` is an idempotent upsert and returns the same stable, unique cursor
  * for every reference with the same retention id. `candidates(limit)` must
- * construct each cursor from trusted record metadata, keep it separate from
- * the untrusted stored reference payload, and not pre-materialize more than
- * `limit` candidates. Identity calls `next()` at most `limit` times and never
- * enumerates the challenge collection. `complete()` removes the entry named
- * by the opaque cursor even when its payload is malformed.
+ * construct each cursor and immutable locator from trusted record metadata,
+ * keep them separate from the untrusted stored reference payload, and not
+ * pre-materialize more than `limit` candidates. Identity calls `next()` at
+ * most `limit` times and never enumerates the challenge collection.
+ * `complete()` removes the entry named by the opaque cursor even when its
+ * payload is malformed.
  */
 export interface ChallengeRetention {
   track(
@@ -72,20 +83,35 @@ export interface ChallengeRetention {
 
 /** In-memory retention index for tests and non-durable development hosts. */
 export function createMemoryChallengeRetention(): ChallengeRetention {
-  const references = new Map<string, ChallengeRetentionReference>();
+  const references = new Map<
+    string,
+    {
+      readonly locator: ChallengeRetentionLocator;
+      readonly reference: ChallengeRetentionReference;
+    }
+  >();
   return {
     async track(reference) {
-      references.set(reference.retentionId, Object.freeze({ ...reference }));
+      references.set(
+        reference.retentionId,
+        Object.freeze({
+          locator: Object.freeze({
+            retentionId: reference.retentionId,
+            handleHash: reference.handleHash,
+          }),
+          reference: Object.freeze({ ...reference }),
+        }),
+      );
       return reference.retentionId;
     },
     async *candidates(limit) {
       let yielded = 0;
-      for (const [cursor, reference] of references) {
+      for (const [cursor, entry] of references) {
         if (yielded >= limit) {
           break;
         }
         yielded += 1;
-        yield Object.freeze({ cursor, reference });
+        yield Object.freeze({ cursor, ...entry });
       }
     },
     async complete(cursor) {
@@ -186,6 +212,66 @@ function retentionCursor(value: unknown): ChallengeRetentionCursor {
   }
 }
 
+function retentionLocator(value: unknown): ChallengeRetentionLocator {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new IdentityError(
+      "invalid_state",
+      "Challenge retention returned an invalid locator.",
+    );
+  }
+  const prototype = Object.getPrototypeOf(value);
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const keys = Reflect.ownKeys(descriptors);
+  const retentionId = descriptors.retentionId;
+  const handleHash = descriptors.handleHash;
+  if (
+    (prototype !== Object.prototype && prototype !== null) ||
+    keys.length !== 2 ||
+    keys.some(
+      (key) =>
+        typeof key === "symbol" ||
+        (key !== "retentionId" && key !== "handleHash"),
+    ) ||
+    retentionId === undefined ||
+    !retentionId.enumerable ||
+    !("value" in retentionId) ||
+    handleHash === undefined ||
+    !handleHash.enumerable ||
+    !("value" in handleHash)
+  ) {
+    throw new IdentityError(
+      "invalid_state",
+      "Challenge retention returned an invalid locator.",
+    );
+  }
+  try {
+    return Object.freeze({
+      retentionId: assertHash(
+        assertBoundedString(
+          retentionId.value,
+          "Retention locator identifier",
+          64,
+        ),
+        "Retention locator identifier",
+      ),
+      handleHash: assertHash(
+        assertBoundedString(
+          handleHash.value,
+          "Retention locator handle hash",
+          64,
+        ),
+        "Retention locator handle hash",
+      ),
+    });
+  } catch (cause) {
+    throw new IdentityError(
+      "invalid_state",
+      "Challenge retention returned an invalid locator.",
+      { cause },
+    );
+  }
+}
+
 function retentionCandidate(value: unknown): ChallengeRetentionCandidate {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new IdentityError(
@@ -197,17 +283,22 @@ function retentionCandidate(value: unknown): ChallengeRetentionCandidate {
   const descriptors = Object.getOwnPropertyDescriptors(value);
   const keys = Reflect.ownKeys(descriptors);
   const cursor = descriptors.cursor;
+  const locator = descriptors.locator;
   const reference = descriptors.reference;
   if (
     (prototype !== Object.prototype && prototype !== null) ||
-    keys.length !== 2 ||
+    keys.length !== 3 ||
     keys.some(
       (key) =>
-        typeof key === "symbol" || (key !== "cursor" && key !== "reference"),
+        typeof key === "symbol" ||
+        (key !== "cursor" && key !== "locator" && key !== "reference"),
     ) ||
     cursor === undefined ||
     !cursor.enumerable ||
     !("value" in cursor) ||
+    locator === undefined ||
+    !locator.enumerable ||
+    !("value" in locator) ||
     reference === undefined ||
     !reference.enumerable ||
     !("value" in reference)
@@ -219,6 +310,7 @@ function retentionCandidate(value: unknown): ChallengeRetentionCandidate {
   }
   return Object.freeze({
     cursor: retentionCursor(cursor.value),
+    locator: retentionLocator(locator.value),
     reference: reference.value,
   });
 }
@@ -512,17 +604,10 @@ export function createChallengeService(
           const reference = retentionReference(candidate.reference);
           if (reference === null) {
             rejected += 1;
-            try {
-              await options.retention.complete(candidate.cursor);
-              completed += 1;
-            } catch {
-              retryNeeded = true;
-            }
-            continue;
           }
           inspected += 1;
           const row = await collection.getVersioned(
-            challengeKey(reference.handleHash),
+            challengeKey(candidate.locator.handleHash),
           );
           if (row === null) {
             try {
@@ -535,11 +620,13 @@ export function createChallengeService(
           }
           const matchesLookup =
             row.value.partition === "challenges" &&
-            row.value.id === reference.handleHash &&
-            row.value.handleHash === reference.handleHash;
+            row.value.id === candidate.locator.handleHash &&
+            row.value.handleHash === candidate.locator.handleHash &&
+            row.value.retentionId === candidate.locator.retentionId;
           if (!matchesLookup) {
-            // Never discard the only pointer when storage returned a row
-            // that cannot be proven to match the candidate's lookup key.
+            // Trusted locator metadata and authoritative storage disagree.
+            // Retain the pointer and fail closed rather than deriving any
+            // repair or deletion authority from the corrupt payload.
             retryNeeded = true;
             continue;
           }
@@ -550,34 +637,12 @@ export function createChallengeService(
           });
           let authoritativeCursor = candidate.cursor;
           let cursorConfirmed = false;
-          const retentionIdentityMatches =
-            row.value.retentionId === reference.retentionId;
-          if (!retentionIdentityMatches) {
-            // The handle located a row, but the retention identity did not.
-            // Restore that row's own pointer, settle a provably different
-            // stale cursor, and never use this candidate to delete the row.
-            try {
-              authoritativeCursor = retentionCursor(
-                await options.retention.track(authoritativeReference),
-              );
-            } catch {
-              retryNeeded = true;
-              continue;
-            }
-            if (authoritativeCursor !== candidate.cursor) {
-              try {
-                await options.retention.complete(candidate.cursor);
-                completed += 1;
-              } catch {
-                // The authoritative cursor now exists, so a stale cursor is
-                // harmless and can be retried without orphaning the row.
-                retryNeeded = true;
-              }
-            }
-            retryNeeded = true;
-            continue;
-          }
-          if (row.value.expiresAt !== reference.expiresAt) {
+          const referenceMatches =
+            reference !== null &&
+            reference.retentionId === candidate.locator.retentionId &&
+            reference.handleHash === candidate.locator.handleHash &&
+            reference.expiresAt === row.value.expiresAt;
+          if (!referenceMatches) {
             try {
               authoritativeCursor = retentionCursor(
                 await options.retention.track(authoritativeReference),
@@ -627,7 +692,7 @@ export function createChallengeService(
             }
           }
           const removed = await collection.deleteIfUnchanged(
-            challengeKey(reference.handleHash),
+            challengeKey(candidate.locator.handleHash),
             row.version,
           );
           if (!removed) {

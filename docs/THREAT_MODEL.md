@@ -77,9 +77,10 @@ Security invariants:
   attempt-bounded, and version-conditionally swept through a caller-supplied
   durable lazy retention index. A sweep pulls and inspects at most its limit;
   it never enumerates the authoritative challenge collection. Each candidate
-  carries a trusted host-issued cursor from record metadata separately from
-  its untrusted payload, so malformed payloads can be discarded and valid
-  pointers can be repaired from authoritative rows without orphaning them.
+  carries a trusted host-issued cursor and immutable retention-id/handle
+  locator from record metadata separately from its untrusted payload, so
+  malformed payloads can be advanced and valid pointers can be repaired from
+  authoritative rows without orphaning them.
 - A positive nonzero signature counter must strictly increase. A counter may
   remain zero only when both stored and newly reported values are zero.
 - Raw token-shaped values, future one-time codes, and challenge verification
@@ -113,11 +114,13 @@ limiting constrain the budget. The harmless retention reference is written
 before its authoritative challenge, so crashes can create stale references
 but not unsweepable rows. Retention adapters idempotently upsert by retention
 identity, return one stable unique cursor, and derive candidate cursors from
-record metadata rather than corruptible payload fields. Sweep discards a
-malformed payload by that cursor, repairs a mismatched pointer from the
-authoritative challenge before settling stale entries, and therefore prevents
-one poisoned front entry from starving the bounded scan. Authentication uses
-discoverable credentials and does not accept an email identity hint.
+record metadata together with an immutable retention-id/handle locator rather
+than trusting corruptible payload fields. Sweep uses that locator to recover
+the authoritative challenge, repairs a fully malformed or substituted payload
+before settling its cursor, and discards an entry only when the trusted
+locator has no row. One poisoned front entry therefore cannot starve the
+bounded scan or orphan a reachable challenge. Authentication uses discoverable
+credentials and does not accept an email identity hint.
 Verification pins the expected RP ID, allowed origin, challenge digest, and
 required user verification. Credential IDs are structurally unique and
 signature-counter transitions use optimistic concurrency.
@@ -134,11 +137,12 @@ Storage poisoning can target codecs, sweep key reconstruction, or state
 machines. Codecs validate types, exact enum values, timestamp shape, hashes,
 and identity relationships. Sweeps delete only keys reconstructed from valid
 authoritative records and pair each with the version returned for that record.
-Retention payloads never provide removal authority: their separate trusted
-cursor advances malformed entries, while any payload that locates an existing
-challenge is repaired before its old cursor can be settled, and the stable
-cursor for an authoritative reference is reconfirmed before deletion. Unknown
-authoritative states are retained for investigation and never promoted.
+Retention payloads never provide lookup or removal authority: their separate
+trusted cursor and immutable locator advance missing rows, while every
+existing challenge is repaired before its old cursor can be settled, and the
+stable cursor for an authoritative reference is reconfirmed before deletion.
+Unknown authoritative states are retained for investigation and never
+promoted.
 
 Object-shape attacks can hide work in getters or prototypes. Public structured
 inputs are copied from property descriptors only after rejecting accessors,
