@@ -16,14 +16,14 @@ The protected assets are:
 - the structural uniqueness of the canonical email lookup;
 - passkey credential public keys and signature counters;
 - short-lived WebAuthn challenge state;
+- short-lived email-code operation state and its durable Mail intent;
 - the integrity of `{ issuer, subject, emailVerified: true }` claims; and
 - availability of enrollment, authentication, recovery, and repair.
 
-Email-code delivery and its durable outbox are intentionally not implemented
-until `@pegma/mail@0.1.0` provides the shared contract. When that phase lands,
-mailbox control will be the account-recovery security floor. The component
-cannot make a compromised mailbox safe; hosts must communicate that limit and
-should encourage passkey enrollment.
+Mailbox control is the account-recovery security floor. The component cannot
+make a compromised mailbox safe; hosts must communicate that limit and should
+encourage passkey enrollment. `@pegma/mail@0.1.0` provides durable
+at-least-once delivery state while the provider remains host-owned.
 
 ## Threat Model, Trust Boundaries, and Assumptions
 
@@ -45,7 +45,11 @@ The primary boundaries are:
    closed on malformed or stale records. Cross-collection atomicity is not
    assumed; only documented single-partition transactions and optimistic
    conditions are available.
-5. A host may mint a session from returned claims. Session lifetime,
+5. The host owns an HMAC key of at least 32 random bytes, a trusted mail
+   renderer, provider, authenticated callback boundary, reconciliation port,
+   and two durable rate-limit policies. Provider idempotency and finite
+   renderer/provider timeouts shorter than the Mail lease are required.
+6. A host may mint a session from returned claims. Session lifetime,
    revocation, cookies, CSRF defenses, and authorization are outside this
    repository and belong to `@pegma/sessions` and authorization components.
 
@@ -57,7 +61,7 @@ email, credential ID, or `PrincipalId`; none is treated as a secret.
 
 Operator-controlled inputs include issuer, RP ID, origin allowlists, clock and
 ID ports, storage configuration, endpoint authentication, rate-limit keys,
-and future mail delivery. Developer-controlled inputs include dependency
+HMAC key rotation, and mail delivery. Developer-controlled inputs include dependency
 updates, collection codecs, release tooling, and CI.
 
 Security invariants:
@@ -97,14 +101,33 @@ Security invariants:
   which repair finalizes the index. A crash on either side of the mirror write
   is replayable without weakening owner, generation, or counter-regression
   checks.
-- Raw token-shaped values, future one-time codes, and challenge verification
+- Raw token-shaped values, one-time codes, and challenge verification
   material never enter storage, logs, or error messages.
+- Eight-digit codes are deterministically derived with unbiased rejection
+  sampling from a domain-separated HMAC. Storage contains only a separately
+  domain-separated keyed verifier and hashed handle, so a database-only
+  attacker cannot validate offline guesses.
+- V1 does not support live HMAC-key rotation. Rotation pauses new operations,
+  invalidates or drains all code operations, and settles/sweeps every
+  nonterminal Mail job before replacing the key. Emergency replacement first
+  invalidates pending operations.
+- Code state and initial delivery intent commit in one Identity-owned
+  operation/Mail transaction. Unknown fallback/recovery commits a suppression
+  row in the same request shape and can never become valid after later signup.
+- A pending code is single-use through optimistic update. Known authentication
+  rechecks that the active principal still owns the email observed at begin.
+- Email change is a repairable cross-collection saga. Old-address notification
+  is atomically enqueued with completed operation state only after User and
+  new-index agreement.
+- Mail delivery is at least once. Provider idempotency keys fence ambiguous
+  sends; authenticated callbacks are generation-fenced; dead-letter and
+  terminal-unknown outcomes remain operator-visible until acknowledged.
 - Malformed storage and malformed/accessor-bearing request objects fail
   closed. Validation must not execute attacker-provided getters.
-- Email-code creation, fallback, and recovery will return indistinguishable
-  responses for known and unknown emails. Those flows remain unavailable
-  until the shared mail contract exists rather than shipping a partial,
-  enumerable substitute.
+- Email-code creation, fallback, and recovery return indistinguishable public
+  shapes for known and unknown emails. Both limiter dimensions and the same
+  operation transaction are performed without short-circuiting. Hosts with a
+  remote timing threat should additionally enforce a response timing floor.
 
 The model assumes HTTPS outside explicit localhost development, correct
 browser WebAuthn implementations, secure host endpoint authentication for
@@ -188,7 +211,7 @@ equivalent emails, replaying an assertion, submitting a cloned authenticator
 whose nonzero counter regresses, exhausting challenges, corrupting storage
 records, or exploiting a parser in the WebAuthn dependency. An attacker who
 already controls the host process, production storage credentials, the
-configured origin/RP ID, or the future recovery mailbox is beyond what this
+configured origin/RP ID, HMAC key, mail provider, or recovery mailbox is beyond what this
 library can contain. Session theft, CSRF, and permission mistakes are material
 to the composed application but are outside this repository's code surface.
 
@@ -203,12 +226,12 @@ attacker code as this package.
 **High:** creating two active principals for one canonical email; replaying
 one challenge to authenticate more than once; accepting the wrong RP ID or
 origin; accepting absent user verification; silently accepting a nonzero
-counter regression; or exposing raw future code/challenge secrets from
+counter regression; or exposing raw code/challenge secrets from
 storage.
 
 **Medium:** a bounded denial of service against enrollment or sign-in;
 permanent orphaned reservations without repair; cross-account passkey removal
-that cannot itself issue claims; email enumeration through a future fallback
+that cannot itself issue claims; email enumeration through a fallback
 flow; or malformed records causing a fail-closed outage in one partition.
 
 **Low:** unbounded diagnostic detail that contains no secret or account

@@ -54,6 +54,18 @@ export interface UserService {
   findUserByEmail(email: string): Promise<User | null>;
   getUser(principalId: PrincipalId): Promise<User | null>;
   claimsFor(principalId: PrincipalId): Promise<VerifiedIdentityClaims>;
+  activeUserForEmail(email: string): Promise<User | null>;
+  changeVerifiedEmail(input: {
+    readonly principalId: PrincipalId;
+    readonly oldEmailHash: string;
+    readonly newEmail: string;
+    readonly operationHash: string;
+  }): Promise<User>;
+  finalizeVerifiedEmailChange(input: {
+    readonly principalId: PrincipalId;
+    readonly newEmail: string;
+    readonly operationHash: string;
+  }): Promise<User>;
 }
 
 function publicUser(record: UserRecord): User {
@@ -137,6 +149,7 @@ export function createUserService(options: UserServiceOptions): UserService {
       emailVerified: false,
       createdAt: index.createdAt,
       updatedAt: index.updatedAt,
+      emailChangeOperationHash: null,
     };
     const inserted = await users.insertIfAbsent(proposed);
     if (
@@ -303,6 +316,12 @@ export function createUserService(options: UserServiceOptions): UserService {
           await prepareUser(current);
           return activateUser(current, now);
         }
+        case "change_reserved":
+        case "retiring":
+          throw new IdentityError(
+            "invalid_state",
+            "Email change requires its owning repair operation.",
+          );
       }
     }
     throw new IdentityError(
@@ -346,6 +365,8 @@ export function createUserService(options: UserServiceOptions): UserService {
         createdAt: now,
         updatedAt: now,
         repairAfter: addMilliseconds(milliseconds, options.repairDelayMs),
+        changeOperationHash: null,
+        replacementEmailHash: null,
       };
       const inserted = await indexes.insertIfAbsent(reservation);
       if (
@@ -381,6 +402,10 @@ export function createUserService(options: UserServiceOptions): UserService {
       const digest = await emailHash(email);
       const index = await indexes.get(emailKey(digest));
       if (index === null) {
+        // Enumeration-sensitive callers still perform one deterministic User
+        // read without placing contact data in a backend key.
+        const dummyHash = await principalHash(`email-decoy:${digest}`);
+        await users.get(userKey(dummyHash));
         return null;
       }
       if (index.email !== email || index.emailHash !== digest) {
@@ -389,7 +414,37 @@ export function createUserService(options: UserServiceOptions): UserService {
           "Email index does not match its lookup key.",
         );
       }
-      return publicUser(await repair(index));
+      await assertEmailIndexOwner(index);
+      if (index.state === "change_reserved") {
+        return null;
+      }
+      if (index.state === "retiring") {
+        const user = await readUser(index.principalId, index.principalHash);
+        if (user === null || user.status !== "active" || !user.emailVerified) {
+          throw new IdentityError(
+            "storage_corrupt",
+            "Retiring email index has no owner.",
+          );
+        }
+        return user.emailHash === index.emailHash ? publicUser(user) : null;
+      }
+      const user =
+        index.state === "active"
+          ? await readUser(index.principalId, index.principalHash)
+          : await repair(index);
+      if (
+        user === null ||
+        user.email !== index.email ||
+        user.emailHash !== index.emailHash ||
+        user.status !== "active" ||
+        !user.emailVerified
+      ) {
+        throw new IdentityError(
+          "storage_corrupt",
+          "Active email index does not match its user.",
+        );
+      }
+      return publicUser(user);
     },
 
     async getUser(input) {
@@ -405,6 +460,458 @@ export function createUserService(options: UserServiceOptions): UserService {
         throw new IdentityError("not_found", "User was not found.");
       }
       return claims(options.issuer, user);
+    },
+
+    async activeUserForEmail(input) {
+      const email = normalizeEmail(input);
+      const digest = await emailHash(email);
+      const index = await indexes.get(emailKey(digest));
+      if (index === null) {
+        const dummyHash = await principalHash(`email-decoy:${digest}`);
+        await users.get(userKey(dummyHash));
+        return null;
+      }
+      if (index.email !== email || index.emailHash !== digest) {
+        throw new IdentityError(
+          "storage_corrupt",
+          "Email index does not match its lookup key.",
+        );
+      }
+      await assertEmailIndexOwner(index);
+      if (index.state === "change_reserved") {
+        await readUser(index.principalId, index.principalHash);
+        return null;
+      }
+      if (index.state === "retiring") {
+        const user = await readUser(index.principalId, index.principalHash);
+        if (user === null || user.status !== "active" || !user.emailVerified) {
+          throw new IdentityError(
+            "storage_corrupt",
+            "Retiring email index has no active owner.",
+          );
+        }
+        return user.emailHash === index.emailHash ? publicUser(user) : null;
+      }
+      const user =
+        index.state === "active"
+          ? await readUser(index.principalId, index.principalHash)
+          : await repair(index);
+      if (
+        user === null ||
+        user.email !== index.email ||
+        user.emailHash !== index.emailHash
+      ) {
+        throw new IdentityError(
+          "storage_corrupt",
+          "Active email index does not match its user.",
+        );
+      }
+      return user.status === "active" && user.emailVerified
+        ? publicUser(user)
+        : null;
+    },
+
+    async changeVerifiedEmail(input) {
+      const safe = copyDataOnly(input);
+      const requestedPrincipal = assertPrincipalId(
+        dataField(safe, "principalId"),
+      );
+      const expectedOldHash = assertBoundedString(
+        dataField(safe, "oldEmailHash"),
+        "Old email hash",
+        64,
+      );
+      const operationHash = assertBoundedString(
+        dataField(safe, "operationHash"),
+        "Email change operation",
+        64,
+      );
+      if (
+        !/^[0-9a-f]{64}$/u.test(expectedOldHash) ||
+        !/^[0-9a-f]{64}$/u.test(operationHash)
+      ) {
+        throw new IdentityError(
+          "invalid_input",
+          "Email change input is invalid.",
+        );
+      }
+      const newEmail = normalizeEmail(dataField(safe, "newEmail"));
+      const [ownerHash, newEmailHash] = await Promise.all([
+        principalHash(requestedPrincipal),
+        emailHash(newEmail),
+      ]);
+      const userKeyValue = userKey(ownerHash);
+      async function releaseOperationReservation(): Promise<boolean> {
+        const latest = await indexes.getVersioned(emailKey(newEmailHash));
+        if (latest === null) {
+          return true;
+        }
+        if (
+          latest.value.state !== "change_reserved" ||
+          latest.value.principalId !== requestedPrincipal ||
+          latest.value.principalHash !== ownerHash ||
+          latest.value.email !== newEmail ||
+          latest.value.emailHash !== newEmailHash ||
+          latest.value.changeOperationHash !== operationHash
+        ) {
+          return true;
+        }
+        return indexes.deleteIfUnchanged(
+          emailKey(newEmailHash),
+          latest.version,
+        );
+      }
+
+      async function rejectBeforeClaim(): Promise<never> {
+        if (!(await releaseOperationReservation())) {
+          throw new IdentityError(
+            "invalid_state",
+            "Email change reservation cleanup did not converge.",
+          );
+        }
+        throw new IdentityError(
+          "verification_failed",
+          "Email verification failed.",
+        );
+      }
+
+      let currentUser = await users.get(userKeyValue);
+      if (currentUser === null) {
+        return rejectBeforeClaim();
+      }
+      if (
+        currentUser.principalId !== requestedPrincipal ||
+        currentUser.principalHash !== ownerHash ||
+        currentUser.status !== "active" ||
+        !currentUser.emailVerified
+      ) {
+        await rejectBeforeClaim();
+      }
+      if (
+        currentUser.emailHash !== expectedOldHash &&
+        currentUser.emailHash !== newEmailHash
+      ) {
+        await rejectBeforeClaim();
+      }
+      if (
+        currentUser.emailHash === newEmailHash &&
+        currentUser.emailChangeOperationHash !== operationHash
+      ) {
+        await rejectBeforeClaim();
+      }
+      const alreadySwitched = currentUser.emailHash === newEmailHash;
+      const oldEmail = currentUser.email;
+      const { value: now, milliseconds } = timestampFromClock(options.clock);
+      const newReservation: EmailIndexRecord = {
+        ...emailKey(newEmailHash),
+        email: newEmail,
+        emailHash: newEmailHash,
+        principalId: requestedPrincipal,
+        principalHash: ownerHash,
+        operationId: operationHash,
+        state: "change_reserved",
+        createdAt: now,
+        updatedAt: now,
+        repairAfter: addMilliseconds(milliseconds, options.repairDelayMs),
+        changeOperationHash: operationHash,
+        replacementEmailHash: null,
+      };
+      const reserved = await indexes.insertIfAbsent(newReservation);
+      const reservationMismatch =
+        reserved.value.principalId !== requestedPrincipal ||
+        reserved.value.principalHash !== ownerHash ||
+        reserved.value.email !== newEmail ||
+        reserved.value.emailHash !== newEmailHash ||
+        (reserved.value.state === "change_reserved"
+          ? reserved.value.changeOperationHash !== operationHash
+          : !alreadySwitched || reserved.value.state !== "active");
+
+      if (reservationMismatch) {
+        await rejectBeforeClaim();
+      }
+
+      if (!alreadySwitched && expectedOldHash !== newEmailHash) {
+        const oldIndex = await indexes.get(emailKey(expectedOldHash));
+        if (
+          oldIndex === null ||
+          oldIndex.state !== "active" ||
+          oldIndex.principalId !== requestedPrincipal ||
+          oldIndex.principalHash !== ownerHash ||
+          oldIndex.email !== oldEmail ||
+          oldIndex.emailHash !== expectedOldHash ||
+          oldIndex.changeOperationHash !== null ||
+          oldIndex.replacementEmailHash !== null
+        ) {
+          await rejectBeforeClaim();
+        }
+      }
+
+      if (currentUser.emailHash === expectedOldHash) {
+        const claimed = await users.update(
+          userKeyValue,
+          (current) => {
+            if (
+              current === null ||
+              current.principalId !== requestedPrincipal ||
+              current.principalHash !== ownerHash ||
+              current.status !== "active" ||
+              !current.emailVerified ||
+              current.emailHash !== expectedOldHash ||
+              (current.emailChangeOperationHash !== null &&
+                current.emailChangeOperationHash !== operationHash)
+            ) {
+              return { action: "keep" };
+            }
+            return {
+              action: "write",
+              value: {
+                ...current,
+                emailChangeOperationHash: operationHash,
+                updatedAt: now,
+              },
+            };
+          },
+          { maxAttempts: 10 },
+        );
+        if (
+          claimed.value === null ||
+          claimed.value.emailChangeOperationHash !== operationHash
+        ) {
+          await rejectBeforeClaim();
+        }
+        currentUser = claimed.value;
+      }
+
+      if (expectedOldHash !== newEmailHash) {
+        const oldIndex = await indexes.update(
+          emailKey(expectedOldHash),
+          (current) => {
+            if (
+              current === null ||
+              current.principalId !== requestedPrincipal ||
+              current.principalHash !== ownerHash ||
+              current.email !== oldEmail ||
+              current.emailHash !== expectedOldHash
+            ) {
+              return { action: "keep" };
+            }
+            if (
+              current.state === "retiring" &&
+              current.changeOperationHash === operationHash &&
+              current.replacementEmailHash === newEmailHash
+            ) {
+              return { action: "keep" };
+            }
+            if (current.state !== "active") {
+              return { action: "keep" };
+            }
+            return {
+              action: "write",
+              value: {
+                ...current,
+                state: "retiring",
+                changeOperationHash: operationHash,
+                replacementEmailHash: newEmailHash,
+                updatedAt: now,
+              },
+            };
+          },
+          { maxAttempts: 10 },
+        );
+        if (
+          oldIndex.value !== null &&
+          (oldIndex.value.state !== "retiring" ||
+            oldIndex.value.changeOperationHash !== operationHash ||
+            oldIndex.value.replacementEmailHash !== newEmailHash)
+        ) {
+          throw new IdentityError(
+            "invalid_state",
+            "Email change repair did not retire the old lookup.",
+          );
+        }
+        if (oldIndex.value === null && !alreadySwitched) {
+          throw new IdentityError(
+            "invalid_state",
+            "Email change repair lost the old lookup.",
+          );
+        }
+      }
+
+      const switched = await users.update(
+        userKeyValue,
+        (current) => {
+          if (
+            current === null ||
+            current.principalId !== requestedPrincipal ||
+            current.principalHash !== ownerHash ||
+            current.status !== "active" ||
+            !current.emailVerified ||
+            (current.emailChangeOperationHash !== operationHash &&
+              current.emailHash !== newEmailHash)
+          ) {
+            return { action: "keep" };
+          }
+          if (current.emailHash === newEmailHash) {
+            return { action: "keep" };
+          }
+          if (current.emailHash !== expectedOldHash) {
+            return { action: "keep" };
+          }
+          return {
+            action: "write",
+            value: {
+              ...current,
+              email: newEmail,
+              emailHash: newEmailHash,
+              updatedAt: now,
+            },
+          };
+        },
+        { maxAttempts: 10 },
+      );
+      if (
+        switched.value === null ||
+        switched.value.email !== newEmail ||
+        switched.value.emailHash !== newEmailHash
+      ) {
+        throw new IdentityError(
+          "invalid_state",
+          "Email change repair did not update the user.",
+        );
+      }
+
+      const activated = await indexes.update(
+        emailKey(newEmailHash),
+        (current) => {
+          if (
+            current === null ||
+            current.principalId !== requestedPrincipal ||
+            current.principalHash !== ownerHash ||
+            current.email !== newEmail ||
+            current.emailHash !== newEmailHash
+          ) {
+            return { action: "keep" };
+          }
+          if (current.state === "active") {
+            return { action: "keep" };
+          }
+          if (
+            current.state !== "change_reserved" ||
+            current.changeOperationHash !== operationHash
+          ) {
+            return { action: "keep" };
+          }
+          return {
+            action: "write",
+            value: {
+              ...current,
+              state: "active",
+              changeOperationHash: null,
+              replacementEmailHash: null,
+              updatedAt: now,
+            },
+          };
+        },
+        { maxAttempts: 10 },
+      );
+      if (activated.value?.state !== "active") {
+        throw new IdentityError(
+          "invalid_state",
+          "Email change repair did not activate the new lookup.",
+        );
+      }
+
+      if (expectedOldHash !== newEmailHash) {
+        const old = await indexes.getVersioned(emailKey(expectedOldHash));
+        if (
+          old !== null &&
+          old.value.state === "retiring" &&
+          old.value.changeOperationHash === operationHash &&
+          old.value.replacementEmailHash === newEmailHash
+        ) {
+          await indexes.deleteIfUnchanged(
+            emailKey(expectedOldHash),
+            old.version,
+          );
+        }
+      }
+
+      const retained = await users.get(userKeyValue);
+      if (
+        retained === null ||
+        retained.emailHash !== newEmailHash ||
+        retained.emailChangeOperationHash !== operationHash
+      ) {
+        throw new IdentityError(
+          "invalid_state",
+          "Email change ownership was lost before durable notification.",
+        );
+      }
+      return publicUser(retained);
+    },
+
+    async finalizeVerifiedEmailChange(input) {
+      const safe = copyDataOnly(input);
+      const requestedPrincipal = assertPrincipalId(
+        dataField(safe, "principalId"),
+      );
+      const newEmail = normalizeEmail(dataField(safe, "newEmail"));
+      const operationHash = assertBoundedString(
+        dataField(safe, "operationHash"),
+        "Email change operation",
+        64,
+      );
+      if (!/^[0-9a-f]{64}$/u.test(operationHash)) {
+        throw new IdentityError(
+          "invalid_input",
+          "Email change input is invalid.",
+        );
+      }
+      const [ownerHash, newEmailHash] = await Promise.all([
+        principalHash(requestedPrincipal),
+        emailHash(newEmail),
+      ]);
+      const now = timestampFromClock(options.clock).value;
+      const finalized = await users.update(
+        userKey(ownerHash),
+        (current) => {
+          if (
+            current === null ||
+            current.principalId !== requestedPrincipal ||
+            current.principalHash !== ownerHash ||
+            current.email !== newEmail ||
+            current.emailHash !== newEmailHash ||
+            current.status !== "active" ||
+            !current.emailVerified ||
+            (current.emailChangeOperationHash !== operationHash &&
+              current.emailChangeOperationHash !== null)
+          ) {
+            return { action: "keep" };
+          }
+          return current.emailChangeOperationHash === null
+            ? { action: "keep" }
+            : {
+                action: "write",
+                value: {
+                  ...current,
+                  emailChangeOperationHash: null,
+                  updatedAt: now,
+                },
+              };
+        },
+        { maxAttempts: 10 },
+      );
+      if (
+        finalized.value === null ||
+        finalized.value.emailHash !== newEmailHash ||
+        finalized.value.emailChangeOperationHash !== null
+      ) {
+        throw new IdentityError(
+          "invalid_state",
+          "Email change finalization did not converge.",
+        );
+      }
+      return publicUser(finalized.value);
     },
   };
 }

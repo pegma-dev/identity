@@ -2,12 +2,13 @@
 
 ## Status
 
-**Stage:** foundation implemented (`0.0.0`, unpublished). Phase 1's
-user/email-index model and Phase 3's passkey/challenge foundation are built
-and tested over memory plus real Azurite races. Phase 2 email-code delivery is
-deliberately blocked on `@pegma/mail@0.1.0`; no local mail contract has been
-invented. The threat model and hardened release scaffold landed early because
-they gate every identity change.
+**Stage:** full passwordless lifecycle implemented (`0.0.0`, unpublished).
+The user/email-index model, durable email-code creation/fallback/recovery and
+email-change lifecycle, and passkey/challenge foundation are built and tested
+over memory plus real Azurite races. Mail delivery uses exact
+`@pegma/mail@0.1.0`; Identity owns the operation/Mail union required to commit
+code state and delivery intent atomically. The threat model and hardened
+release scaffold gate every identity change.
 
 **License:** MIT
 
@@ -55,8 +56,9 @@ normalization (case-folding, Unicode) is ONE function, used everywhere.
 key, signature counter, transports. Users may hold several; adding and
 removing them are first-class flows.
 
-**One-time code** — the email channel: 6–8 digit code (or equivalent magic
-link token), stored HASHED, single-use via a conditional update, short TTL.
+**One-time code** — the email channel: an eight-digit HMAC-derived code,
+stored only as a separately domain-separated keyed verifier, single-use via a
+conditional update, short TTL.
 Codes serve enrollment verification, sign-in fallback, and recovery — three
 uses, one mechanism, one set of invariants.
 
@@ -168,7 +170,8 @@ breach; it gets the ceremony that deserves.
 
 One package: `packages/identity` publishing `@pegma/identity`.
 Dependencies: exact `@pegma/spine@0.1.1`,
-`@pegma/storage-core@0.4.0`, `@pegma/rate-limit@0.1.0`, and
+`@pegma/storage-core@0.4.0`, `@pegma/rate-limit@0.1.0`,
+`@pegma/mail@0.1.0`, and
 `@simplewebauthn/server@13.3.2`, `unicode-case-folding@1.1.1`,
 `unorm@1.6.0`, and `tr46@6.0.0`. Framework-free flows are functions the host's
 HTTP layer calls, same posture as every Pegma component.
@@ -181,12 +184,16 @@ User + email-index collections, canonical normalization, structural
 uniqueness, the claims shape. Race tests: concurrent same-email creation
 converges on one user.
 
-### Phase 2 — the email-code flows (pending `@pegma/mail@0.1.0`)
+### Phase 2 — the email-code flows (implemented)
 
-Creation, verification, fallback sign-in, recovery, email change — the
-full lifecycle WITHOUT passkeys (a passwordless-by-email component is
-already usable). Enumeration-resistance tests pin uniform responses;
-rate-limit integration lands here.
+Creation, verification, fallback sign-in, recovery, and a repairable email
+change saga are implemented over an Identity-owned operation/Mail union.
+Eight-digit codes are HMAC-derived without modulo bias; storage contains only
+the hashed handle and a separately domain-separated keyed verifier. Known and
+unknown flows have uniform public shapes and durable suppression for unknown
+fallback/recovery. Durable rate limiting, authoritative sweeps, Mail
+worker/callback/acknowledgement wrappers, and old-address notification are
+part of this phase.
 
 ### Phase 3 — passkeys (foundation implemented)
 
@@ -203,17 +210,15 @@ First publish follows the ecosystem bootstrap rule (npm/cli#8544).
 
 ## Timing
 
-The storage, rate-limit, and WebAuthn prerequisites now exist, so the
-independent Phase 1 and Phase 3 foundations are implemented. Email-code
-enrollment, fallback, recovery, email change, notification, and durable
-delivery remain queued behind `@pegma/mail@0.1.0`. This repository will not
-copy the support desk's local mail shape or invent a competing contract.
+The storage, rate-limit, WebAuthn, and Mail prerequisites now exist. Phases 1,
+2, and 3 are implemented. The remaining work before an advertised release is
+the Phase 4 adversarial review and first-consumer integration.
 
 ## Open questions
 
-**Magic links vs. codes.** Links are one-click but leak into mailbox
-previews, get consumed by security scanners, and break cross-device
-sign-in; codes type anywhere. Lean codes-only; decide in Phase 2.
+**Magic links vs. codes (resolved).** V1 is codes-only. Links leak into
+mailbox previews, can be consumed by security scanners, and break
+cross-device sign-in; eight-digit codes type anywhere.
 
 **PrincipalId as subject.** Using the storage principal directly as the
 claim subject is simple and stable; an argument exists for an opaque

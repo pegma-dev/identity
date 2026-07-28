@@ -2,11 +2,17 @@ import { fixedClock } from "@pegma/spine";
 import { createMemoryStore } from "@pegma/storage-core";
 import { describe, expect, it } from "vitest";
 
-import { createIdentity } from "./index.js";
+import { createHmacEmailCodeProtector, createIdentity } from "./index.js";
 
 const allow = {
   async allow() {
     return { allowed: true as const };
+  },
+};
+const durableAllow = {
+  ...allow,
+  async sweep() {
+    return { scanned: 0, deleted: 0 };
   },
 };
 
@@ -19,6 +25,11 @@ function identity() {
     origins: ["https://example.test"],
     registrationLimiter: allow,
     authenticationLimiter: allow,
+    emailCodeProtector: createHmacEmailCodeProtector(
+      new Uint8Array(32).fill(7),
+    ),
+    emailCodeRequestLimiter: durableAllow,
+    emailCodeVerificationLimiter: durableAllow,
     clock: fixedClock("2026-07-27T12:00:00.000Z"),
   });
 }
