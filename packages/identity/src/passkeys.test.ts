@@ -1100,6 +1100,112 @@ describe.each([
     ).resolves.toHaveLength(2);
   });
 
+  it.each([
+    "null value",
+    "array value",
+    "non-object value",
+    "overlong key",
+    "overlong version",
+  ] as const)(
+    "isolates a corrupt first physical row with a %s across a restarted cursor sweep",
+    async (corruption) => {
+      const { nextStore } = create();
+      const sentinelId = "0".repeat(64);
+      const rawChallenges = defineCollection<StoredRecord>({
+        name: challengesCollection.name,
+        key: (record) => ({
+          partition: String(record.partition),
+          id: String(record.id),
+        }),
+        codec: {
+          encode: (record) => record,
+          decode: (record) => record,
+        },
+      });
+      await nextStore().collection(rawChallenges).put({
+        partition: "challenges",
+        id: sentinelId,
+        malformed: true,
+      });
+      let now = "2026-07-27T12:00:00.000Z";
+      await service(nextStore(), {
+        clock: { now: () => now },
+      }).beginPasskeyAuthentication("expired");
+      now = "2026-07-27T12:06:00.000Z";
+
+      const corruptedStore = (): Store => {
+        const inner = nextStore();
+        return {
+          collection<T>(
+            definition: CollectionDefinition<T>,
+          ): CollectionStore<T> {
+            const collection = inner.collection(definition);
+            if (definition.name !== challengesCollection.name) {
+              return collection;
+            }
+            return {
+              ...collection,
+              async scan(options) {
+                const page = await collection.scan(options);
+                return {
+                  records: page.records.map((row) => {
+                    if (row.key.id !== sentinelId) {
+                      return row;
+                    }
+                    switch (corruption) {
+                      case "null value":
+                        return { ...row, value: null };
+                      case "array value":
+                        return { ...row, value: [] };
+                      case "non-object value":
+                        return { ...row, value: "malformed" };
+                      case "overlong key":
+                        return {
+                          ...row,
+                          key: { ...row.key, id: "x".repeat(1_025) },
+                        };
+                      case "overlong version":
+                        return { ...row, version: "x".repeat(16_385) };
+                    }
+                  }),
+                  nextCursor: page.nextCursor,
+                } as unknown as typeof page;
+              },
+            };
+          },
+        };
+      };
+
+      let cursor: string | undefined;
+      let rejected = 0;
+      let deleted = 0;
+      let passes = 0;
+      do {
+        const result = await service(corruptedStore(), {
+          clock: { now: () => now },
+        }).sweepChallenges(1, cursor);
+        expect(result.pulled).toBeLessThanOrEqual(1);
+        rejected += result.rejected;
+        deleted += result.deleted;
+        passes += 1;
+        cursor = result.cursor ?? undefined;
+        if (!result.hasMore) {
+          break;
+        }
+      } while (passes < 5);
+
+      expect(passes).toBe(2);
+      expect(rejected).toBe(1);
+      expect(deleted).toBe(1);
+      expect(cursor).toBeUndefined();
+      await expect(
+        nextStore()
+          .collection(rawChallenges)
+          .get({ partition: "challenges", id: sentinelId }),
+      ).resolves.not.toBeNull();
+    },
+  );
+
   it("makes concurrent sweeper replays repeat-safe", async () => {
     const { nextStore } = create();
     let now = "2026-07-27T12:00:00.000Z";

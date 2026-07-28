@@ -13,7 +13,7 @@ import { describe, expect, it } from "vitest";
 
 import { TABLE_PORT } from "../../../test/azurite.js";
 import { createIdentity, IdentityError, normalizeEmail } from "./index.js";
-import { emailHash } from "./crypto.js";
+import { emailHash, principalHash } from "./crypto.js";
 import {
   challengesCollection,
   emailIndexesCollection,
@@ -359,6 +359,145 @@ describe("repair and hostile input", () => {
       ),
     ).rejects.toMatchObject({ code: "storage_corrupt" });
     expect(writeDecisions).toBe(0);
+  });
+
+  it("does not follow a different coherent reservation returned from a kept transition", async () => {
+    const inner = createMemoryStore();
+    let failIndexTransition = true;
+    const crashing: Store = {
+      collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
+        const collection = inner.collection(definition);
+        if (definition.name !== "pegma_identity_email_indexes") {
+          return collection;
+        }
+        return {
+          ...collection,
+          async update(key, decide, options) {
+            if (failIndexTransition) {
+              failIndexTransition = false;
+              throw new Error("simulated crash");
+            }
+            return collection.update(key, decide, options);
+          },
+        };
+      },
+    };
+    const email = "reservation-race@example.test";
+    await expect(
+      identity(crashing).provisionVerifiedUser({
+        principalId: "original-reservation-principal",
+        email,
+      }),
+    ).rejects.toThrow("simulated crash");
+
+    const digest = await emailHash(email);
+    const indexes = inner.collection(emailIndexesCollection);
+    const key = {
+      partition: `email-${digest.slice(0, 16)}`,
+      id: digest,
+    };
+    const original = await indexes.get(key);
+    if (original === null) {
+      throw new Error("expected an email reservation");
+    }
+    const replacementPrincipal = "replacement-reservation-principal";
+    const replacement = {
+      ...original,
+      principalId: replacementPrincipal,
+      principalHash: await principalHash(replacementPrincipal),
+      operationId: "replacement-operation",
+    };
+
+    let replacementReturned = false;
+    let crossOperationMutations = 0;
+    let transitionCalls = 0;
+    const substituting: Store = {
+      collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
+        const collection = inner.collection(definition);
+        if (definition.name === "pegma_identity_email_indexes") {
+          return {
+            ...collection,
+            async update(_key, decide) {
+              transitionCalls += 1;
+              if (transitionCalls > 1) {
+                throw new Error("repair followed the replacement reservation");
+              }
+              await expect(decide(original as T)).resolves.toMatchObject({
+                action: "write",
+              });
+              await expect(decide(replacement as T)).resolves.toEqual({
+                action: "keep",
+              });
+              replacementReturned = true;
+              return {
+                written: false,
+                value: replacement as T,
+                attempts: 1,
+              };
+            },
+          };
+        }
+        return {
+          ...collection,
+          async insertIfAbsent(value) {
+            if (replacementReturned) {
+              crossOperationMutations += 1;
+            }
+            return collection.insertIfAbsent(value);
+          },
+          async put(value) {
+            if (replacementReturned) {
+              crossOperationMutations += 1;
+            }
+            return collection.put(value);
+          },
+          async putIfUnchanged(value, version) {
+            if (replacementReturned) {
+              crossOperationMutations += 1;
+            }
+            return collection.putIfUnchanged(value, version);
+          },
+          async update(updateKey, decide, options) {
+            if (replacementReturned) {
+              crossOperationMutations += 1;
+            }
+            return options === undefined
+              ? collection.update(updateKey, decide)
+              : collection.update(updateKey, decide, options);
+          },
+          async delete(deleteKey) {
+            if (replacementReturned) {
+              crossOperationMutations += 1;
+            }
+            return collection.delete(deleteKey);
+          },
+          async deleteIfUnchanged(deleteKey, version) {
+            if (replacementReturned) {
+              crossOperationMutations += 1;
+            }
+            return collection.deleteIfUnchanged(deleteKey, version);
+          },
+          async transact(partition, actions) {
+            if (replacementReturned) {
+              crossOperationMutations += 1;
+            }
+            return collection.transact(partition, actions);
+          },
+        };
+      },
+    };
+
+    await expect(
+      identity(substituting).repairUserByEmail(email),
+    ).rejects.toMatchObject({ code: "conflict" });
+    expect(replacementReturned).toBe(true);
+    expect(transitionCalls).toBe(1);
+    expect(crossOperationMutations).toBe(0);
+    await expect(indexes.get(key)).resolves.toMatchObject({
+      principalId: original.principalId,
+      operationId: original.operationId,
+      state: "reserved",
+    });
   });
 
   it.each([

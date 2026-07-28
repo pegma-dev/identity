@@ -66,12 +66,12 @@ export interface ChallengeSweepResult {
 
 interface SafeScanRecord {
   readonly key: { readonly partition: string; readonly id: string };
-  readonly value: StoredRecord;
+  readonly value: unknown;
   readonly version: string;
 }
 
 interface SafeScanPage {
-  readonly records: readonly SafeScanRecord[];
+  readonly records: readonly unknown[];
   readonly nextCursor: string | null;
 }
 
@@ -151,9 +151,6 @@ function scanRecord(value: unknown): SafeScanRecord {
     (Object.getPrototypeOf(key) !== Object.prototype &&
       Object.getPrototypeOf(key) !== null) ||
     Reflect.ownKeys(Object.getOwnPropertyDescriptors(key)).length !== 2 ||
-    typeof record !== "object" ||
-    record === null ||
-    Array.isArray(record) ||
     typeof version !== "string" ||
     version.length === 0 ||
     version.length > 16_384
@@ -180,7 +177,7 @@ function scanRecord(value: unknown): SafeScanRecord {
   }
   return Object.freeze({
     key: Object.freeze({ partition, id }),
-    value: record as StoredRecord,
+    value: record,
     version,
   });
 }
@@ -223,7 +220,7 @@ function scanPage(value: unknown, limit: number): SafeScanPage {
     );
   }
   const descriptors = Object.getOwnPropertyDescriptors(records);
-  const safeRecords: SafeScanRecord[] = [];
+  const safeRecords: unknown[] = [];
   for (let index = 0; index < records.length; index += 1) {
     const descriptor = descriptors[String(index)];
     if (
@@ -236,7 +233,7 @@ function scanPage(value: unknown, limit: number): SafeScanPage {
         "Challenge scan returned malformed data.",
       );
     }
-    safeRecords.push(scanRecord(descriptor.value));
+    safeRecords.push(descriptor.value);
   }
   if (
     Reflect.ownKeys(descriptors).filter((key) => key !== "length").length !==
@@ -504,11 +501,25 @@ export function createChallengeService(
       let deleted = 0;
       let rejected = 0;
 
-      for (const row of page.records) {
+      for (const rawRow of page.records) {
         inspected += 1;
+        let row: SafeScanRecord;
         let challenge: ChallengeRecord;
         try {
-          challenge = challengesCollection.codec.decode(row.value);
+          row = scanRecord(rawRow);
+          if (
+            typeof row.value !== "object" ||
+            row.value === null ||
+            Array.isArray(row.value)
+          ) {
+            throw new IdentityError(
+              "storage_corrupt",
+              "Stored challenge is malformed.",
+            );
+          }
+          challenge = challengesCollection.codec.decode(
+            row.value as StoredRecord,
+          );
         } catch {
           rejected += 1;
           continue;

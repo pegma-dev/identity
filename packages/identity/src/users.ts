@@ -189,6 +189,19 @@ export function createUserService(options: UserServiceOptions): UserService {
         "Email reservation disappeared during repair.",
       );
     }
+    await assertEmailIndexOwner(result.value);
+    if (
+      result.value.operationId !== index.operationId ||
+      result.value.principalId !== index.principalId ||
+      result.value.principalHash !== index.principalHash ||
+      result.value.email !== index.email ||
+      result.value.emailHash !== index.emailHash
+    ) {
+      throw new IdentityError(
+        "conflict",
+        "Email reservation changed during repair.",
+      );
+    }
     return result.value;
   }
 
