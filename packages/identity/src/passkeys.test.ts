@@ -6,9 +6,11 @@ import type { Clock, PrincipalId } from "@pegma/spine";
 import { createAzureTablesStore } from "@pegma/storage-azure-tables";
 import {
   createMemoryStore,
+  defineCollection,
   type CollectionDefinition,
   type CollectionStore,
   type Store,
+  type StoredRecord,
 } from "@pegma/storage-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -102,6 +104,7 @@ import {
   createMemoryChallengeRetention,
   IdentityError,
   type ChallengeRetention,
+  type ChallengeRetentionReference,
 } from "./index.js";
 import { validCounterTransition } from "./passkeys.js";
 import { TABLE_PORT } from "../../../test/azurite.js";
@@ -125,6 +128,196 @@ function createAzuriteStore(): Store {
   });
   return createAzureTablesStore({ client });
 }
+
+interface InspectableRetention extends ChallengeRetention {
+  corrupt(cursor: string, reference: unknown): Promise<void>;
+  inject(cursor: string, reference: unknown): Promise<void>;
+  peek(cursor: string): Promise<unknown | null>;
+  cursors(): readonly string[];
+}
+
+interface RetentionHarness {
+  readonly name: string;
+  create(): {
+    readonly store: Store;
+    readonly retention: InspectableRetention;
+  };
+}
+
+function createInspectableMemoryRetention(): InspectableRetention {
+  const references = new Map<string, unknown>();
+  const order: string[] = [];
+  return {
+    async track(reference) {
+      if (!references.has(reference.retentionId)) {
+        order.push(reference.retentionId);
+      }
+      references.set(reference.retentionId, Object.freeze({ ...reference }));
+      return reference.retentionId;
+    },
+    async *candidates(limit) {
+      let yielded = 0;
+      for (const cursor of order) {
+        if (yielded >= limit) {
+          break;
+        }
+        if (!references.has(cursor)) {
+          continue;
+        }
+        yielded += 1;
+        yield { cursor, reference: references.get(cursor) };
+      }
+    },
+    async complete(cursor) {
+      references.delete(cursor);
+      const index = order.indexOf(cursor);
+      if (index !== -1) {
+        order.splice(index, 1);
+      }
+    },
+    async corrupt(cursor, reference) {
+      if (!references.has(cursor)) {
+        throw new Error("retention cursor was not found");
+      }
+      references.set(cursor, reference);
+    },
+    async inject(cursor, reference) {
+      if (!references.has(cursor)) {
+        order.unshift(cursor);
+      }
+      references.set(cursor, reference);
+    },
+    async peek(cursor) {
+      return references.get(cursor) ?? null;
+    },
+    cursors() {
+      return [...order];
+    },
+  };
+}
+
+interface StoredRetentionRecord {
+  readonly partition: "retention";
+  readonly id: string;
+  readonly payload: string;
+}
+
+const storedRetentionCollection = defineCollection<StoredRetentionRecord>({
+  name: "pegma_identity_test_retention",
+  key: ({ partition, id }) => ({ partition, id }),
+  codec: {
+    encode: (value) => ({ ...value }),
+    decode(record: StoredRecord) {
+      const partition = Object.getOwnPropertyDescriptor(record, "partition");
+      const id = Object.getOwnPropertyDescriptor(record, "id");
+      const payload = Object.getOwnPropertyDescriptor(record, "payload");
+      if (
+        partition === undefined ||
+        !("value" in partition) ||
+        partition.value !== "retention" ||
+        id === undefined ||
+        !("value" in id) ||
+        typeof id.value !== "string" ||
+        payload === undefined ||
+        !("value" in payload) ||
+        typeof payload.value !== "string"
+      ) {
+        throw new Error("stored retention record is malformed");
+      }
+      return { partition: "retention", id: id.value, payload: payload.value };
+    },
+  },
+});
+
+function createStoredRetention(store: Store): InspectableRetention {
+  const records = store.collection(storedRetentionCollection);
+  const order: string[] = [];
+  const write = async (cursor: string, reference: unknown) => {
+    await records.put({
+      partition: "retention",
+      id: cursor,
+      payload: JSON.stringify(reference),
+    });
+  };
+  return {
+    async track(reference) {
+      const cursor = reference.retentionId;
+      if (!order.includes(cursor)) {
+        order.push(cursor);
+      }
+      await write(cursor, reference);
+      return cursor;
+    },
+    async *candidates(limit) {
+      let yielded = 0;
+      for (const cursor of order) {
+        if (yielded >= limit) {
+          break;
+        }
+        const record = await records.get({
+          partition: "retention",
+          id: cursor,
+        });
+        if (record === null) {
+          continue;
+        }
+        yielded += 1;
+        yield {
+          // The cursor comes from host index metadata, never payload JSON.
+          cursor: record.id,
+          reference: JSON.parse(record.payload) as unknown,
+        };
+      }
+    },
+    async complete(cursor) {
+      await records.delete({ partition: "retention", id: cursor });
+      const index = order.indexOf(cursor);
+      if (index !== -1) {
+        order.splice(index, 1);
+      }
+    },
+    async corrupt(cursor, reference) {
+      if (
+        (await records.get({ partition: "retention", id: cursor })) === null
+      ) {
+        throw new Error("retention cursor was not found");
+      }
+      await write(cursor, reference);
+    },
+    async inject(cursor, reference) {
+      if (!order.includes(cursor)) {
+        order.unshift(cursor);
+      }
+      await write(cursor, reference);
+    },
+    async peek(cursor) {
+      const record = await records.get({ partition: "retention", id: cursor });
+      return record === null ? null : (JSON.parse(record.payload) as unknown);
+    },
+    cursors() {
+      return [...order];
+    },
+  };
+}
+
+const retentionHarnesses: readonly RetentionHarness[] = [
+  {
+    name: "memory",
+    create() {
+      return {
+        store: createMemoryStore(),
+        retention: createInspectableMemoryRetention(),
+      };
+    },
+  },
+  {
+    name: "host-like stored adapter on Azurite",
+    create() {
+      const store = createAzuriteStore();
+      return { store, retention: createStoredRetention(store) };
+    },
+  },
+];
 
 function registrationResponse() {
   return {
@@ -554,6 +747,124 @@ describe("challenge controls", () => {
     });
   });
 
+  it.each(retentionHarnesses)(
+    "repairs a genuine $name cursor whose stored expiry payload was corrupted",
+    async ({ create }) => {
+      let now = "2026-07-27T12:00:00.000Z";
+      const { store, retention } = create();
+      const identity = service(store, {
+        clock: { now: () => now },
+        challengeRetention: retention,
+      });
+      await identity.beginPasskeyAuthentication("request");
+      const cursor = retention.cursors()[0];
+      if (cursor === undefined) {
+        throw new Error("expected a retention cursor");
+      }
+      const tracked = (await retention.peek(
+        cursor,
+      )) as ChallengeRetentionReference;
+      await retention.corrupt(cursor, {
+        ...tracked,
+        expiresAt: "2026-07-27T12:04:00.000Z",
+      });
+      now = "2026-07-27T12:03:00.000Z";
+
+      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
+        pulled: 1,
+        inspected: 1,
+        deleted: 0,
+        completed: 0,
+        rejected: 0,
+        hasMore: true,
+      });
+      await expect(retention.peek(cursor)).resolves.toMatchObject({
+        retentionId: tracked.retentionId,
+        handleHash: tracked.handleHash,
+        expiresAt: "2026-07-27T12:05:00.000Z",
+      });
+
+      now = "2026-07-27T12:06:00.000Z";
+      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
+        deleted: 1,
+        completed: 1,
+      });
+      await expect(retention.peek(cursor)).resolves.toBeNull();
+    },
+  );
+
+  it.each(retentionHarnesses)(
+    "discards a malformed front entry by trusted $name cursor without starving the next challenge",
+    async ({ create }) => {
+      let now = "2026-07-27T12:00:00.000Z";
+      const { store, retention } = create();
+      const identity = service(store, {
+        clock: { now: () => now },
+        challengeRetention: retention,
+      });
+      await identity.beginPasskeyAuthentication("request");
+      const challengeCursor = retention.cursors()[0];
+      if (challengeCursor === undefined) {
+        throw new Error("expected a retention cursor");
+      }
+      const malformedCursor = "host-metadata-malformed";
+      await retention.inject(malformedCursor, "malformed payload");
+      now = "2026-07-27T12:06:00.000Z";
+
+      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
+        pulled: 1,
+        inspected: 0,
+        deleted: 0,
+        completed: 1,
+        rejected: 1,
+        hasMore: true,
+      });
+      await expect(retention.peek(malformedCursor)).resolves.toBeNull();
+
+      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
+        pulled: 1,
+        inspected: 1,
+        deleted: 1,
+        completed: 1,
+      });
+      await expect(retention.peek(challengeCursor)).resolves.toBeNull();
+    },
+  );
+
+  it.each(retentionHarnesses)(
+    "does not let a wrong $name reference delete the challenge its handle happens to locate",
+    async ({ create }) => {
+      let now = "2026-07-27T12:00:00.000Z";
+      const { store, retention } = create();
+      const identity = service(store, {
+        clock: { now: () => now },
+        challengeRetention: retention,
+      });
+      await identity.beginPasskeyAuthentication("first");
+      await identity.beginPasskeyAuthentication("second");
+      const [wrongCursor, unrelatedCursor] = retention.cursors();
+      if (wrongCursor === undefined || unrelatedCursor === undefined) {
+        throw new Error("expected two retention cursors");
+      }
+      const unrelated = (await retention.peek(
+        unrelatedCursor,
+      )) as ChallengeRetentionReference;
+      await retention.corrupt(wrongCursor, unrelated);
+      now = "2026-07-27T12:06:00.000Z";
+
+      await expect(identity.sweepChallenges(1)).resolves.toMatchObject({
+        pulled: 1,
+        inspected: 1,
+        deleted: 0,
+        completed: 1,
+        hasMore: true,
+      });
+      await expect(retention.peek(unrelatedCursor)).resolves.toMatchObject(
+        unrelated,
+      );
+    },
+  );
+
   it("pulls at most one lazy candidate for sweep(1) and never scans or deletes an unrelated row", async () => {
     const references: Array<{
       readonly retentionId: string;
@@ -567,11 +878,12 @@ describe("challenge controls", () => {
     const retention: ChallengeRetention = {
       async track(reference) {
         references.push(reference);
+        return reference.retentionId;
       },
       async *candidates() {
         for (const reference of references) {
           sourcePulls += 1;
-          yield reference;
+          yield { cursor: reference.retentionId, reference };
         }
       },
       async complete() {},
@@ -634,10 +946,13 @@ describe("challenge controls", () => {
     const retention: ChallengeRetention = {
       async track(reference) {
         references.push(reference);
+        return reference.retentionId;
       },
       async *candidates() {
         try {
-          yield* references;
+          for (const reference of references) {
+            yield { cursor: reference.retentionId, reference };
+          }
         } finally {
           finalized = true;
         }
@@ -697,11 +1012,15 @@ describe("challenge controls", () => {
       readonly handleHash: string;
       readonly expiresAt: string;
     }> = [];
-    let candidates: unknown[] = [];
+    let candidates: Array<{
+      readonly cursor: string;
+      readonly reference: unknown;
+    }> = [];
     let getters = 0;
     const retention: ChallengeRetention = {
       async track(reference) {
         tracked.push(reference);
+        return reference.retentionId;
       },
       async *candidates() {
         yield* candidates;
@@ -730,19 +1049,28 @@ describe("challenge controls", () => {
       expiresAt: { enumerable: true, value: actual.expiresAt },
     });
     candidates = [
-      accessor,
       {
-        retentionId: actual.retentionId,
-        handleHash: actual.handleHash,
-        expiresAt: "2026-07-27T12:04:00.000Z",
+        cursor: "malformed-accessor",
+        reference: accessor,
       },
       {
-        retentionId: "b".repeat(64),
-        handleHash: "a".repeat(64),
-        expiresAt: actual.expiresAt,
+        cursor: actual.retentionId,
+        reference: {
+          retentionId: actual.retentionId,
+          handleHash: actual.handleHash,
+          expiresAt: "2026-07-27T12:04:00.000Z",
+        },
       },
-      actual,
-      actual,
+      {
+        cursor: "wrong-reference",
+        reference: {
+          retentionId: "b".repeat(64),
+          handleHash: "a".repeat(64),
+          expiresAt: actual.expiresAt,
+        },
+      },
+      { cursor: actual.retentionId, reference: actual },
+      { cursor: actual.retentionId, reference: actual },
     ];
     now = "2026-07-27T12:06:00.000Z";
 

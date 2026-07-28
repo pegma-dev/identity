@@ -39,17 +39,35 @@ export interface ChallengeRetentionReference {
   readonly expiresAt: IsoTimestamp;
 }
 
+export type ChallengeRetentionCursor = string;
+
+export interface ChallengeRetentionCandidate {
+  /**
+   * Opaque, trusted key constructed by the host adapter from retention-record
+   * metadata, never from the possibly corrupt reference payload.
+   */
+  readonly cursor: ChallengeRetentionCursor;
+  /** Untrusted stored payload; Identity validates it without invoking getters. */
+  readonly reference: unknown;
+}
+
 /**
  * A durable, lazily-read retention index supplied by the host.
  *
- * `candidates(limit)` must not pre-materialize more than `limit` references.
- * Identity calls `next()` at most `limit` times and never enumerates the
- * challenge collection. `complete()` removes a settled reference.
+ * `track()` is an idempotent upsert and returns the same stable, unique cursor
+ * for every reference with the same retention id. `candidates(limit)` must
+ * construct each cursor from trusted record metadata, keep it separate from
+ * the untrusted stored reference payload, and not pre-materialize more than
+ * `limit` candidates. Identity calls `next()` at most `limit` times and never
+ * enumerates the challenge collection. `complete()` removes the entry named
+ * by the opaque cursor even when its payload is malformed.
  */
 export interface ChallengeRetention {
-  track(reference: ChallengeRetentionReference): Promise<void>;
-  candidates(limit: number): AsyncIterable<unknown>;
-  complete(reference: ChallengeRetentionReference): Promise<void>;
+  track(
+    reference: ChallengeRetentionReference,
+  ): Promise<ChallengeRetentionCursor>;
+  candidates(limit: number): AsyncIterable<ChallengeRetentionCandidate>;
+  complete(cursor: ChallengeRetentionCursor): Promise<void>;
 }
 
 /** In-memory retention index for tests and non-durable development hosts. */
@@ -58,19 +76,20 @@ export function createMemoryChallengeRetention(): ChallengeRetention {
   return {
     async track(reference) {
       references.set(reference.retentionId, Object.freeze({ ...reference }));
+      return reference.retentionId;
     },
     async *candidates(limit) {
       let yielded = 0;
-      for (const reference of references.values()) {
+      for (const [cursor, reference] of references) {
         if (yielded >= limit) {
           break;
         }
         yielded += 1;
-        yield reference;
+        yield Object.freeze({ cursor, reference });
       }
     },
-    async complete(reference) {
-      references.delete(reference.retentionId);
+    async complete(cursor) {
+      references.delete(cursor);
     },
   };
 }
@@ -155,6 +174,55 @@ function retentionReference(
   }
 }
 
+function retentionCursor(value: unknown): ChallengeRetentionCursor {
+  try {
+    return assertBoundedString(value, "Retention cursor", 1_024);
+  } catch (cause) {
+    throw new IdentityError(
+      "invalid_state",
+      "Challenge retention returned an invalid cursor.",
+      { cause },
+    );
+  }
+}
+
+function retentionCandidate(value: unknown): ChallengeRetentionCandidate {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new IdentityError(
+      "invalid_state",
+      "Challenge retention returned an invalid candidate.",
+    );
+  }
+  const prototype = Object.getPrototypeOf(value);
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const keys = Reflect.ownKeys(descriptors);
+  const cursor = descriptors.cursor;
+  const reference = descriptors.reference;
+  if (
+    (prototype !== Object.prototype && prototype !== null) ||
+    keys.length !== 2 ||
+    keys.some(
+      (key) =>
+        typeof key === "symbol" || (key !== "cursor" && key !== "reference"),
+    ) ||
+    cursor === undefined ||
+    !cursor.enumerable ||
+    !("value" in cursor) ||
+    reference === undefined ||
+    !reference.enumerable ||
+    !("value" in reference)
+  ) {
+    throw new IdentityError(
+      "invalid_state",
+      "Challenge retention returned an invalid candidate.",
+    );
+  }
+  return Object.freeze({
+    cursor: retentionCursor(cursor.value),
+    reference: reference.value,
+  });
+}
+
 export function createChallengeService(
   options: ChallengeServiceOptions,
 ): ChallengeService {
@@ -221,11 +289,12 @@ export function createChallengeService(
           handleHash,
           expiresAt: record.expiresAt,
         });
+        let cursor: ChallengeRetentionCursor;
         try {
           // Track the harmless digest reference first. A crash can leave a
           // stale reference, which sweep settles safely; it can never leave
           // an authoritative challenge with no bounded path to retention.
-          await options.retention.track(reference);
+          cursor = retentionCursor(await options.retention.track(reference));
         } catch (cause) {
           throw new IdentityError(
             "invalid_state",
@@ -238,7 +307,7 @@ export function createChallengeService(
           return handle;
         }
         try {
-          await options.retention.complete(reference);
+          await options.retention.complete(cursor);
         } catch {
           // A collision reference is safe to retain: its unique retention id
           // cannot match the authoritative row and sweep will settle it.
@@ -439,10 +508,16 @@ export function createChallengeService(
             break;
           }
           pulled += 1;
-          const reference = retentionReference(next.value);
+          const candidate = retentionCandidate(next.value);
+          const reference = retentionReference(candidate.reference);
           if (reference === null) {
             rejected += 1;
-            retryNeeded = true;
+            try {
+              await options.retention.complete(candidate.cursor);
+              completed += 1;
+            } catch {
+              retryNeeded = true;
+            }
             continue;
           }
           inspected += 1;
@@ -451,29 +526,77 @@ export function createChallengeService(
           );
           if (row === null) {
             try {
-              await options.retention.complete(reference);
+              await options.retention.complete(candidate.cursor);
               completed += 1;
             } catch {
               retryNeeded = true;
             }
             continue;
           }
-          const authoritative =
+          const matchesLookup =
             row.value.partition === "challenges" &&
             row.value.id === reference.handleHash &&
-            row.value.handleHash === reference.handleHash &&
-            row.value.retentionId === reference.retentionId &&
-            row.value.expiresAt === reference.expiresAt;
-          if (!authoritative) {
-            // A stale or wrong reference never supplies a delete key for a
-            // different row. Settle the reference and retain the record.
+            row.value.handleHash === reference.handleHash;
+          if (!matchesLookup) {
+            // Never discard the only pointer when storage returned a row
+            // that cannot be proven to match the candidate's lookup key.
+            retryNeeded = true;
+            continue;
+          }
+          const authoritativeReference = Object.freeze({
+            retentionId: row.value.retentionId,
+            handleHash: row.value.handleHash,
+            expiresAt: row.value.expiresAt,
+          });
+          let authoritativeCursor = candidate.cursor;
+          let cursorConfirmed = false;
+          const retentionIdentityMatches =
+            row.value.retentionId === reference.retentionId;
+          if (!retentionIdentityMatches) {
+            // The handle located a row, but the retention identity did not.
+            // Restore that row's own pointer, settle a provably different
+            // stale cursor, and never use this candidate to delete the row.
             try {
-              await options.retention.complete(reference);
-              completed += 1;
+              authoritativeCursor = retentionCursor(
+                await options.retention.track(authoritativeReference),
+              );
             } catch {
               retryNeeded = true;
+              continue;
             }
+            if (authoritativeCursor !== candidate.cursor) {
+              try {
+                await options.retention.complete(candidate.cursor);
+                completed += 1;
+              } catch {
+                // The authoritative cursor now exists, so a stale cursor is
+                // harmless and can be retried without orphaning the row.
+                retryNeeded = true;
+              }
+            }
+            retryNeeded = true;
             continue;
+          }
+          if (row.value.expiresAt !== reference.expiresAt) {
+            try {
+              authoritativeCursor = retentionCursor(
+                await options.retention.track(authoritativeReference),
+              );
+            } catch {
+              retryNeeded = true;
+              continue;
+            }
+            if (authoritativeCursor !== candidate.cursor) {
+              try {
+                await options.retention.complete(candidate.cursor);
+                completed += 1;
+              } catch {
+                retryNeeded = true;
+              }
+              retryNeeded = true;
+              continue;
+            }
+            cursorConfirmed = true;
           }
           const removable =
             Date.parse(row.value.expiresAt) <= now ||
@@ -482,6 +605,26 @@ export function createChallengeService(
           if (!removable) {
             retryNeeded = true;
             continue;
+          }
+          if (!cursorConfirmed) {
+            try {
+              authoritativeCursor = retentionCursor(
+                await options.retention.track(authoritativeReference),
+              );
+            } catch {
+              retryNeeded = true;
+              continue;
+            }
+            if (authoritativeCursor !== candidate.cursor) {
+              try {
+                await options.retention.complete(candidate.cursor);
+                completed += 1;
+              } catch {
+                retryNeeded = true;
+              }
+              retryNeeded = true;
+              continue;
+            }
           }
           const removed = await collection.deleteIfUnchanged(
             challengeKey(reference.handleHash),
@@ -493,7 +636,7 @@ export function createChallengeService(
           }
           deleted += 1;
           try {
-            await options.retention.complete(reference);
+            await options.retention.complete(authoritativeCursor);
             completed += 1;
           } catch {
             // The now-stale reference is harmless and will be settled on

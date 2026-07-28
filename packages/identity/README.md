@@ -67,9 +67,14 @@ credential secret.
 Production hosts must also provide a durable `ChallengeRetention`. Identity
 tracks a harmless hash/expiry reference before inserting each authoritative
 challenge, so a crash can leave only a stale reference, never an unsweepable
-challenge. Its `candidates(limit)` implementation must be lazy and must not
-materialize more than `limit` references. The included memory implementation
-is for tests and non-durable development only.
+challenge. `track(reference)` must idempotently upsert the reference and return
+one stable, unique opaque cursor for its `retentionId`. The host adapter's
+`candidates(limit)` must derive that cursor from trusted retention-record
+metadata and return it separately from the untrusted stored `reference`
+payload. It must be lazy and must not materialize more than `limit` candidates.
+`complete(cursor)` removes by trusted cursor even when the payload is
+malformed. The included memory implementation is for tests and non-durable
+development only.
 
 ## Verified provisioning
 
@@ -132,10 +137,14 @@ recovery floor will become available only with the mail phase.
 Run `sweepChallenges(limit)` periodically. It pulls and authoritatively
 inspects at most `limit` lazy retention candidates, never scans the challenge
 collection, key-checks each reference, and deletes only expired or terminal
-records with version-conditional deletion. Stale, duplicate, malformed, and
-wrong references cannot supply a delete key for another row. The returned
-`hasMore` is conservative: `true` means call again now or after currently live
-candidates become eligible; `false` means the source ended during this pass.
+records with version-conditional deletion. A malformed payload is discarded
+by its trusted cursor so it cannot starve later candidates. A valid but
+corrupted payload that still locates an authoritative challenge is repaired
+from that row before any stale cursor is settled. Stale, duplicate, malformed,
+and wrong references cannot supply a delete key for another row or orphan the
+only valid pointer. The returned `hasMore` is conservative: `true` means call
+again now or after currently live candidates become eligible; `false` means
+the source ended during this pass.
 
 ## Security posture
 

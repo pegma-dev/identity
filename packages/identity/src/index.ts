@@ -5,6 +5,8 @@ import type { Store } from "@pegma/storage-core";
 import {
   createChallengeService,
   createMemoryChallengeRetention,
+  type ChallengeRetentionCandidate,
+  type ChallengeRetentionCursor,
   type ChallengeRetention,
   type ChallengeRetentionReference,
   type ChallengeSweepResult,
@@ -302,6 +304,8 @@ export type {
   AuthenticationStart,
   ChallengeSweepResult,
   ChallengeRetention,
+  ChallengeRetentionCandidate,
+  ChallengeRetentionCursor,
   ChallengeRetentionReference,
   FinishAuthenticationInput,
   FinishRegistrationInput,

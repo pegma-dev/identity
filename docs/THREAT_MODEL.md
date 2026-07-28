@@ -76,7 +76,10 @@ Security invariants:
 - Challenges are unpredictable, hashed at rest, short-lived, single-use,
   attempt-bounded, and version-conditionally swept through a caller-supplied
   durable lazy retention index. A sweep pulls and inspects at most its limit;
-  it never enumerates the authoritative challenge collection.
+  it never enumerates the authoritative challenge collection. Each candidate
+  carries a trusted host-issued cursor from record metadata separately from
+  its untrusted payload, so malformed payloads can be discarded and valid
+  pointers can be repaired from authoritative rows without orphaning them.
 - A positive nonzero signature counter must strictly increase. A counter may
   remain zero only when both stored and newly reported values are zero.
 - Raw token-shaped values, future one-time codes, and challenge verification
@@ -108,7 +111,12 @@ TTLs, maximum attempts, bounded identifiers and labels, a required durable
 retention index, truly bounded lazy candidate pulls, and host endpoint rate
 limiting constrain the budget. The harmless retention reference is written
 before its authoritative challenge, so crashes can create stale references
-but not unsweepable rows. Authentication uses
+but not unsweepable rows. Retention adapters idempotently upsert by retention
+identity, return one stable unique cursor, and derive candidate cursors from
+record metadata rather than corruptible payload fields. Sweep discards a
+malformed payload by that cursor, repairs a mismatched pointer from the
+authoritative challenge before settling stale entries, and therefore prevents
+one poisoned front entry from starving the bounded scan. Authentication uses
 discoverable credentials and does not accept an email identity hint.
 Verification pins the expected RP ID, allowed origin, challenge digest, and
 required user verification. Credential IDs are structurally unique and
@@ -125,8 +133,12 @@ state.
 Storage poisoning can target codecs, sweep key reconstruction, or state
 machines. Codecs validate types, exact enum values, timestamp shape, hashes,
 and identity relationships. Sweeps delete only keys reconstructed from valid
-records and pair each with the version returned for that record. Unknown
-states are retained for investigation and never promoted.
+authoritative records and pair each with the version returned for that record.
+Retention payloads never provide removal authority: their separate trusted
+cursor advances malformed entries, while any payload that locates an existing
+challenge is repaired before its old cursor can be settled, and the stable
+cursor for an authoritative reference is reconfirmed before deletion. Unknown
+authoritative states are retained for investigation and never promoted.
 
 Object-shape attacks can hide work in getters or prototypes. Public structured
 inputs are copied from property descriptors only after rejecting accessors,
