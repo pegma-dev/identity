@@ -20,9 +20,10 @@ Passkeys-first, passwordless first-party identity for Pegma hosts.
 
 Email is contact and lookup data, never the identity key. `normalizeEmail` is
 the only normalization path: it compatibility-normalizes Unicode, applies
-locale-independent case folding, and converts the domain's IDNA U-label or
-A-label to one ASCII A-label. The lookup key is a domain-separated digest, so
-backend key metacharacters and raw contact data never become storage keys.
+full Unicode default case folding through the exact-pinned
+`unicode-case-folding@1.1.1`, and converts the domain's IDNA U-label or A-label
+to one ASCII A-label. The lookup key is a domain-separated digest, so backend
+key metacharacters and raw contact data never become storage keys.
 
 This package does not store sessions, resolve roles or permissions, serve
 OIDC/OAuth2, connect social providers, or implement passwords.
@@ -69,7 +70,9 @@ tracks a harmless hash/expiry reference before inserting each authoritative
 challenge, so a crash can leave only a stale reference, never an unsweepable
 challenge. `track(reference)` must idempotently upsert the reference and return
 one stable, unique opaque cursor for its `retentionId`. The host adapter's
-`candidates(limit)` must derive that cursor and an immutable
+`candidates(limit, expiresThrough)` must use a separate trusted expiry-order
+field written by `track()`, return only entries due through the supplied
+timestamp, and derive that cursor and an immutable
 `{ retentionId, handleHash }` locator from trusted retention-record metadata
 and return both separately from the untrusted stored `reference` payload. It
 must be lazy and must not materialize more than `limit` candidates.
@@ -136,16 +139,18 @@ principal. Removing the last passkey is allowed; the documented email
 recovery floor will become available only with the mail phase.
 
 Run `sweepChallenges(limit)` periodically. It pulls and authoritatively
-inspects at most `limit` lazy retention candidates, never scans the challenge
-collection, key-checks each reference, and deletes only expired or terminal
-records with version-conditional deletion. A malformed payload is discarded
-only when its trusted locator has no authoritative row, so it cannot starve
-later candidates. When that row exists, even a fully malformed or substituted
-payload is repaired from the row before any stale cursor is settled. Stale,
-duplicate, malformed, and wrong payloads cannot supply a delete key for
-another row or orphan the only valid pointer. The returned `hasMore` is
-conservative: `true` means call again now or after currently live candidates
-become eligible; `false` means the source ended during this pass.
+inspects at most `limit` lazy due retention candidates, never scans the
+challenge collection, key-checks each reference, and deletes expired records
+with version-conditional deletion. Due ordering uses trusted retention
+metadata rather than the corruptible payload, so a stable or continuously
+refilled prefix of live entries cannot starve expired work. A malformed
+payload is discarded only when its trusted locator has no authoritative row.
+When that row exists, even a fully malformed or substituted payload is
+repaired from the row before any stale cursor is settled. Stale, duplicate,
+malformed, and wrong payloads cannot supply a delete key for another row or
+orphan the only valid pointer. The returned `hasMore` is conservative:
+`true` means call again now; `false` means the due source ended during this
+pass.
 
 ## Security posture
 

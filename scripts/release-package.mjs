@@ -23,6 +23,7 @@ const REQUIRED_DEPENDENCIES = {
   "@pegma/spine": "0.1.1",
   "@pegma/storage-core": "0.3.0",
   "@simplewebauthn/server": "13.3.2",
+  "unicode-case-folding": "1.1.1",
 };
 const ALLOWED_STATIC_FILES = new Set(["LICENSE", "README.md", "package.json"]);
 

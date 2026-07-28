@@ -1,8 +1,11 @@
+import { caseFold } from "unicode-case-folding";
+
 import { IdentityError } from "./errors.js";
 import { assertBoundedString } from "./validation.js";
 
 const FORBIDDEN =
   /[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/u;
+const DEFAULT_IGNORABLE = /\p{Default_Ignorable_Code_Point}/gu;
 const ASCII_DOMAIN_LABEL = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/u;
 
 function canonicalDomain(value: string): string {
@@ -60,10 +63,9 @@ export function normalizeEmail(value: unknown): string {
   if (FORBIDDEN.test(input)) {
     throw new IdentityError("invalid_input", "Email is invalid.");
   }
-  const normalized = input
-    .normalize("NFKC")
+  const normalized = caseFold(input.normalize("NFKC"))
+    .replace(DEFAULT_IGNORABLE, "")
     .trim()
-    .toLowerCase()
     .normalize("NFKC");
   if (
     normalized.length === 0 ||

@@ -34,6 +34,7 @@ import {
   assertPrincipalId,
   copyDataOnly,
   dataField,
+  readDataProperty,
   timestampFromClock,
 } from "./validation.js";
 import type { ChallengeService, ClaimedChallenge } from "./challenges.js";
@@ -135,6 +136,48 @@ function activeUser(user: User | null): asserts user is User {
   }
 }
 
+async function assertCredentialOwner(
+  index: CredentialIndexRecord,
+): Promise<void> {
+  const principalId = readDataProperty(index, "principalId");
+  const storedDigest = readDataProperty(index, "principalHash");
+  if (typeof principalId !== "string" || typeof storedDigest !== "string") {
+    throw new IdentityError(
+      "storage_corrupt",
+      "Stored credential owner is malformed.",
+    );
+  }
+  const expectedDigest = await principalHash(principalId as PrincipalId);
+  if (storedDigest !== expectedDigest) {
+    throw new IdentityError(
+      "storage_corrupt",
+      "Stored credential owner is malformed.",
+    );
+  }
+}
+
+function sameRegistration(
+  current: CredentialIndexRecord,
+  proposed: CredentialIndexRecord,
+): boolean {
+  return (
+    current.credentialHash === proposed.credentialHash &&
+    current.credentialId === proposed.credentialId &&
+    current.registrationId === proposed.registrationId &&
+    current.principalId === proposed.principalId &&
+    current.principalHash === proposed.principalHash &&
+    current.publicKey === proposed.publicKey &&
+    current.counter === proposed.counter &&
+    current.label === proposed.label &&
+    current.createdAt === proposed.createdAt &&
+    current.updatedAt === proposed.updatedAt &&
+    current.transports.length === proposed.transports.length &&
+    current.transports.every(
+      (transport, index) => transport === proposed.transports[index],
+    )
+  );
+}
+
 async function enforce(limiter: RateLimiter, key: string): Promise<void> {
   let decision;
   try {
@@ -201,6 +244,7 @@ export function createPasskeyService(
         if (
           current !== null &&
           (current.principalId !== index.principalId ||
+            current.principalHash !== index.principalHash ||
             current.credentialId !== index.credentialId)
         ) {
           return { action: "keep" };
@@ -243,6 +287,7 @@ export function createPasskeyService(
     if (
       result.value === null ||
       result.value.principalId !== index.principalId ||
+      result.value.principalHash !== index.principalHash ||
       result.value.credentialId !== index.credentialId ||
       result.value.registrationId !== index.registrationId ||
       result.value.state !== "active"
@@ -260,10 +305,14 @@ export function createPasskeyService(
   ): Promise<CredentialIndexRecord> {
     const result = await credentials.update(
       credentialKey(index.credentialHash),
-      (current) => {
+      async (current) => {
+        if (current !== null) {
+          await assertCredentialOwner(current);
+        }
         if (
           current === null ||
           current.principalId !== index.principalId ||
+          current.principalHash !== index.principalHash ||
           current.credentialId !== index.credentialId ||
           current.registrationId !== index.registrationId ||
           current.state !== "reserved"
@@ -281,6 +330,7 @@ export function createPasskeyService(
       result.value === null ||
       result.value.state !== "active" ||
       result.value.principalId !== index.principalId ||
+      result.value.principalHash !== index.principalHash ||
       result.value.registrationId !== index.registrationId
     ) {
       throw new IdentityError(
@@ -294,6 +344,7 @@ export function createPasskeyService(
   async function repair(
     index: CredentialIndexRecord,
   ): Promise<PasskeyRecord | null> {
+    await assertCredentialOwner(index);
     if (index.state === "revoked") {
       const existing = await passkeys.get(
         passkeyKey(index.principalHash, index.credentialHash),
@@ -304,6 +355,7 @@ export function createPasskeyService(
           (current) =>
             current === null ||
             current.principalId !== index.principalId ||
+            current.principalHash !== index.principalHash ||
             current.credentialId !== index.credentialId ||
             current.registrationId !== index.registrationId ||
             current.state === "revoked"
@@ -336,8 +388,10 @@ export function createPasskeyService(
       state: "reserved",
     };
     let index = (await credentials.insertIfAbsent(proposed)).value;
+    await assertCredentialOwner(index);
     if (
       index.principalId !== material.principalId ||
+      index.principalHash !== material.principalHash ||
       index.credentialId !== material.credentialId
     ) {
       throw new IdentityError(
@@ -348,13 +402,18 @@ export function createPasskeyService(
     if (index.state === "revoked") {
       const result = await credentials.update(
         key,
-        (current) =>
-          current === null ||
-          current.principalId !== material.principalId ||
-          current.credentialId !== material.credentialId ||
-          current.state !== "revoked"
+        async (current) => {
+          if (current !== null) {
+            await assertCredentialOwner(current);
+          }
+          return current === null ||
+            current.principalId !== material.principalId ||
+            current.principalHash !== material.principalHash ||
+            current.credentialId !== material.credentialId ||
+            current.state !== "revoked"
             ? { action: "keep" }
-            : { action: "write", value: proposed },
+            : { action: "write", value: proposed };
+        },
         { maxAttempts: 10 },
       );
       if (result.value === null || result.value.state !== "reserved") {
@@ -364,6 +423,13 @@ export function createPasskeyService(
         );
       }
       index = result.value;
+      await assertCredentialOwner(index);
+    }
+    if (!sameRegistration(index, proposed)) {
+      throw new IdentityError(
+        "conflict",
+        "Another credential registration won the race.",
+      );
     }
     const repaired = await repair(index);
     if (repaired === null) {
@@ -565,12 +631,15 @@ export function createPasskeyService(
         2_048,
         "invalid_input",
       );
+      const credentialDigest = await credentialHash(credentialId);
+      const index = await credentials.get(credentialKey(credentialDigest));
+      if (index !== null) {
+        await assertCredentialOwner(index);
+      }
       const claim = await options.challengeService.claimChallenge(
         challengeHandle,
         "authentication",
       );
-      const credentialDigest = await credentialHash(credentialId);
-      const index = await credentials.get(credentialKey(credentialDigest));
       if (
         index === null ||
         index.state !== "active" ||
@@ -609,12 +678,16 @@ export function createPasskeyService(
       let advanced = false;
       const updated = await credentials.update(
         credentialKey(credentialDigest),
-        (current) => {
+        async (current) => {
+          if (current !== null) {
+            await assertCredentialOwner(current);
+          }
           if (
             current === null ||
             current.state !== "active" ||
             current.credentialId !== credentialId ||
             current.principalId !== index.principalId ||
+            current.principalHash !== index.principalHash ||
             current.registrationId !== index.registrationId ||
             !validCounterTransition(current.counter, newCounter)
           ) {
@@ -637,6 +710,7 @@ export function createPasskeyService(
           current === null ||
           current.state !== "active" ||
           current.principalId !== index.principalId ||
+          current.principalHash !== index.principalHash ||
           current.registrationId !== index.registrationId ||
           current.counter > newCounter
             ? { action: "keep" }
@@ -680,14 +754,19 @@ export function createPasskeyService(
         "invalid_input",
       );
       const digest = await credentialHash(credentialId);
+      const principalDigest = await principalHash(principalId);
       const now = timestampFromClock(options.clock).value;
       let revoked = false;
       const result = await credentials.update(
         credentialKey(digest),
-        (current) => {
+        async (current) => {
+          if (current !== null) {
+            await assertCredentialOwner(current);
+          }
           if (
             current === null ||
             current.principalId !== principalId ||
+            current.principalHash !== principalDigest ||
             current.credentialId !== credentialId ||
             current.state !== "active"
           ) {

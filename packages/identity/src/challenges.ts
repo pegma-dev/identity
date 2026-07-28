@@ -65,11 +65,15 @@ export interface ChallengeRetentionCandidate {
  * A durable, lazily-read retention index supplied by the host.
  *
  * `track()` is an idempotent upsert and returns the same stable, unique cursor
- * for every reference with the same retention id. `candidates(limit)` must
- * construct each cursor and immutable locator from trusted record metadata,
- * keep them separate from the untrusted stored reference payload, and not
- * pre-materialize more than `limit` candidates. Identity calls `next()` at
- * most `limit` times and never enumerates the challenge collection.
+ * for every reference with the same retention id.
+ * `candidates(limit, expiresThrough)` must use a trusted, separately stored
+ * expiry ordering key written by `track()`, skip entries later than
+ * `expiresThrough`, construct each cursor and immutable locator from trusted
+ * record metadata, keep them separate from the untrusted stored reference
+ * payload, and not pre-materialize more than `limit` candidates. This due-only
+ * contract prevents a stable prefix of live entries from starving expired
+ * entries across repeated bounded sweeps. Identity calls `next()` at most
+ * `limit` times and never enumerates the challenge collection.
  * `complete()` removes the entry named by the opaque cursor even when its
  * payload is malformed.
  */
@@ -77,7 +81,10 @@ export interface ChallengeRetention {
   track(
     reference: ChallengeRetentionReference,
   ): Promise<ChallengeRetentionCursor>;
-  candidates(limit: number): AsyncIterable<ChallengeRetentionCandidate>;
+  candidates(
+    limit: number,
+    expiresThrough: IsoTimestamp,
+  ): AsyncIterable<ChallengeRetentionCandidate>;
   complete(cursor: ChallengeRetentionCursor): Promise<void>;
 }
 
@@ -88,6 +95,7 @@ export function createMemoryChallengeRetention(): ChallengeRetention {
     {
       readonly locator: ChallengeRetentionLocator;
       readonly reference: ChallengeRetentionReference;
+      readonly expiresAt: IsoTimestamp;
     }
   >();
   return {
@@ -100,18 +108,26 @@ export function createMemoryChallengeRetention(): ChallengeRetention {
             handleHash: reference.handleHash,
           }),
           reference: Object.freeze({ ...reference }),
+          expiresAt: reference.expiresAt,
         }),
       );
       return reference.retentionId;
     },
-    async *candidates(limit) {
+    async *candidates(limit, expiresThrough) {
       let yielded = 0;
       for (const [cursor, entry] of references) {
         if (yielded >= limit) {
           break;
         }
+        if (entry.expiresAt > expiresThrough) {
+          continue;
+        }
         yielded += 1;
-        yield Object.freeze({ cursor, ...entry });
+        yield Object.freeze({
+          cursor,
+          locator: entry.locator,
+          reference: entry.reference,
+        });
       }
     },
     async complete(cursor) {
@@ -580,9 +596,11 @@ export function createChallengeService(
       ) {
         throw new IdentityError("invalid_input", "Sweep limit is invalid.");
       }
-      const now = timestampFromClock(options.clock).milliseconds;
+      const { value: nowValue, milliseconds: now } = timestampFromClock(
+        options.clock,
+      );
       const iterator = options.retention
-        .candidates(limitInput)
+        .candidates(limitInput, nowValue)
         [Symbol.asyncIterator]();
       let pulled = 0;
       let inspected = 0;

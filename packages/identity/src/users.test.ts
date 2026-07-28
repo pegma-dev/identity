@@ -101,6 +101,33 @@ describe("canonical email normalization", () => {
     );
   });
 
+  it("applies full default Unicode case folding before IDNA conversion", () => {
+    expect(normalizeEmail("Straße@bücher.example")).toBe(
+      "strasse@xn--bcher-kva.example",
+    );
+    expect(normalizeEmail("STRASSE@XN--BCHER-KVA.EXAMPLE")).toBe(
+      "strasse@xn--bcher-kva.example",
+    );
+    expect(normalizeEmail("ΟΣ@Παράδειγμα.example")).toBe(
+      normalizeEmail("οσ@παράδειγμα.example"),
+    );
+    expect(normalizeEmail("ος@παράδειγμα.example")).toBe(
+      normalizeEmail("οσ@παράδειγμα.example"),
+    );
+  });
+
+  it("uses Unicode default rather than Turkic-tailored case folding", () => {
+    expect(normalizeEmail("I@example.test")).toBe("i@example.test");
+    expect(normalizeEmail("İ@example.test")).toBe("i̇@example.test");
+    expect(normalizeEmail("ı@example.test")).toBe("ı@example.test");
+  });
+
+  it("applies the NFKC_Casefold default-ignorable mapping", () => {
+    expect(normalizeEmail("soft\u00ADhyphen@example.test")).toBe(
+      "softhyphen@example.test",
+    );
+  });
+
   it.each([
     "a\u0000@example.test",
     "a\u001F@example.test",
@@ -207,6 +234,29 @@ describe.each([
       1,
     );
     expect(results[0]?.email).toBe("person@xn--bcher-kva.example");
+  });
+
+  it("makes full-fold and IDNA variants collide under concurrency", async () => {
+    const service = identity(makeStore());
+    const variants = [
+      "Straße@bücher.example",
+      "STRASSE@XN--BCHER-KVA.EXAMPLE",
+      "Strasse@BÜCHER.example",
+      "straße@xn--bcher-kva.example",
+    ];
+    const results = await Promise.all(
+      Array.from({ length: 16 }, (_, index) =>
+        service.provisionVerifiedUser({
+          principalId: `casefold-principal-${index}` as PrincipalId,
+          email: variants[index % variants.length] ?? variants[0]!,
+        }),
+      ),
+    );
+
+    expect(new Set(results.map(({ principalId }) => principalId))).toHaveLength(
+      1,
+    );
+    expect(results[0]?.email).toBe("strasse@xn--bcher-kva.example");
   });
 });
 
