@@ -15,7 +15,7 @@ _(Scan complete — 7 findings, none Critical/High/Medium. Summary at bottom.)_
 ### F-01 — Privileged claim-issuing primitives on the public API surface
 
 - **Severity:** Low (hardening / trust-boundary documentation)
-- **Status:** Mitigated by documentation — `packages/identity/README.md:153-170` explicitly labels `provisionVerifiedUser` "an explicitly privileged provisioning operation" and warns "Do not expose `provisionVerifiedUser` directly as public signup"; `claimsFor` is shown inside the same privileged block. Residual: the warning covers provisioning but does not separately call out `claimsFor`/`repairUserByEmail`; a one-line addition would close the gap.
+- **Status:** Resolved 2026-07-29 — the "Verified provisioning" section of `packages/identity/README.md` now names all three methods. At scan time it labelled `provisionVerifiedUser` "an explicitly privileged provisioning operation" and warned "Do not expose `provisionVerifiedUser` directly as public signup", but did not separately call out `claimsFor`/`repairUserByEmail`; that residual is closed.
 - **Evidence:** `createIdentity()` exposes `provisionVerifiedUser`, `repairUserByEmail`, and `claimsFor` directly on the frozen public object (`packages/identity/src/index.ts:389-393`). `claimsFor` (`packages/identity/src/users.ts:456-463`) returns `VerifiedIdentityClaims` for **any** principalId that resolves to an active verified user, with no proof of possession. `provisionVerifiedUser` (`packages/identity/src/users.ts:334-382`) creates an already-verified user without any email-code ceremony.
 - **Exploitability:** Not exploitable inside the component — these exist so the verified email-code repair path and host bootstrap can run. Risk is realized only if a host wires them to an unauthenticated route; then arbitrary verified-account creation / claim minting for any known principalId.
 - **Recommendation:** Document in the package README that these three methods must never be reachable from unauthenticated traffic; consider a naming or options-level gate in a future API revision.
@@ -24,7 +24,7 @@ _(Scan complete — 7 findings, none Critical/High/Medium. Summary at bottom.)_
 ### F-02 — Email change requires no fresh authentication; old address notified only after the fact
 
 - **Severity:** Low
-- **Status:** Open — design tradeoff, partially mitigated
+- **Status:** Resolved 2026-07-29 by host guidance — the underlying design tradeoff stands (the component owns no session, so it cannot observe assertion freshness); the obligation now sits explicitly with the host in `packages/identity/README.md` and `docs/THREAT_MODEL.md`.
 - **Evidence:** `begin("email_change", ...)` (`packages/identity/src/email-codes.ts:302-322`) requires only that the principal is active + email-verified. Proof of control of the **new** inbox (`finishEmailChange`) completes the change; the old address receives `old-address-notification` only after `effectState: "complete"` (`packages/identity/src/email-codes.ts:604-619`, `803-870`).
 - **Exploitability:** An attacker holding a hijacked session (sessions are out of component scope) can redirect email-code sign-in and recovery to an inbox they control. Bounded by: passkeys remain bound to the principal (victim retains passkey sign-in and can revert), and the old-address notification is a detective control.
 - **Recommendation:** Host guidance to require a fresh passkey assertion before `beginEmailChange`; confirm coverage in `docs/THREAT_MODEL.md`.
@@ -33,7 +33,7 @@ _(Scan complete — 7 findings, none Critical/High/Medium. Summary at bottom.)_
 ### F-03 — WebAuthn attestation is not verified
 
 - **Severity:** Informational
-- **Status:** Accepted design (confirm in threat model)
+- **Status:** Accepted design — confirmed in `docs/THREAT_MODEL.md` on 2026-07-29
 - **Evidence:** `attestationType: "none"` in `beginRegistration` (`packages/identity/src/passkeys.ts:785`). No authenticator-model/AAGUID policy is possible; software passkeys are permitted.
 - **Exploitability:** N/A for typical consumer passkey deployments; relevant only if a host assumes hardware-bound keys.
 - ✅ Resolved 2026-07-29 — the acceptance is now an explicit invariant in `docs/THREAT_MODEL.md`, stating that attestation is not verified, that software passkeys are accepted, and that hosts needing hardware-bound keys cannot get that assurance here.
@@ -56,7 +56,7 @@ _(Scan complete — 7 findings, none Critical/High/Medium. Summary at bottom.)_
 ### F-06 — `finishAccountCreation` silently doubles as email sign-in for existing accounts
 
 - **Severity:** Informational
-- **Status:** Accepted design — host-policy dependency
+- **Status:** Accepted design — host-policy dependency, documented in `packages/identity/README.md` on 2026-07-29
 - **Evidence:** When a code is verified for an email that already belongs to an active principal, `repair()` returns the existing user (`packages/identity/src/email-codes.ts:689-710`) and `finishAccountCreation` issues `VerifiedIdentityClaims` for that principal (`email-codes.ts:758-774`). The account-creation endpoint is therefore also a full sign-in endpoint.
 - **Exploitability:** None beyond the intended mailbox-control-equals-sign-in model, but a host that treats "signup" as lower-risk than "login" (weaker rate limiting, no session policy, no anomaly detection on the creation route) would under-protect a sign-in path.
 - **Recommendation:** State explicitly in the package README that the creation flow authenticates existing accounts and must carry the same endpoint policy as sign-in.
