@@ -10,36 +10,40 @@ Findings are appended below in the order they were discovered during the scan.
 
 ---
 
-*(Scan complete — 7 findings, none Critical/High/Medium. Summary at bottom.)*
+_(Scan complete — 7 findings, none Critical/High/Medium. Summary at bottom.)_
 
 ### F-01 — Privileged claim-issuing primitives on the public API surface
 
 - **Severity:** Low (hardening / trust-boundary documentation)
-- **Status:** Mitigated by documentation — `packages/identity/README.md:153-170` explicitly labels `provisionVerifiedUser` "an explicitly privileged provisioning operation" and warns "Do not expose `provisionVerifiedUser` directly as public signup"; `claimsFor` is shown inside the same privileged block. Residual: the warning covers provisioning but does not separately call out `claimsFor`/`repairUserByEmail`; a one-line addition would close the gap.
+- **Status:** Resolved 2026-07-29 — the "Verified provisioning" section of `packages/identity/README.md` now names all three methods. At scan time it labelled `provisionVerifiedUser` "an explicitly privileged provisioning operation" and warned "Do not expose `provisionVerifiedUser` directly as public signup", but did not separately call out `claimsFor`/`repairUserByEmail`; that residual is closed.
 - **Evidence:** `createIdentity()` exposes `provisionVerifiedUser`, `repairUserByEmail`, and `claimsFor` directly on the frozen public object (`packages/identity/src/index.ts:389-393`). `claimsFor` (`packages/identity/src/users.ts:456-463`) returns `VerifiedIdentityClaims` for **any** principalId that resolves to an active verified user, with no proof of possession. `provisionVerifiedUser` (`packages/identity/src/users.ts:334-382`) creates an already-verified user without any email-code ceremony.
 - **Exploitability:** Not exploitable inside the component — these exist so the verified email-code repair path and host bootstrap can run. Risk is realized only if a host wires them to an unauthenticated route; then arbitrary verified-account creation / claim minting for any known principalId.
 - **Recommendation:** Document in the package README that these three methods must never be reachable from unauthenticated traffic; consider a naming or options-level gate in a future API revision.
+- ✅ Resolved 2026-07-29 — `packages/identity/README.md` now names `claimsFor` and `repairUserByEmail` as privileged alongside `provisionVerifiedUser` and forbids reaching any of the three from unauthenticated traffic or user-supplied identifiers.
 
 ### F-02 — Email change requires no fresh authentication; old address notified only after the fact
 
 - **Severity:** Low
-- **Status:** Open — design tradeoff, partially mitigated
+- **Status:** Resolved 2026-07-29 by host guidance — the underlying design tradeoff stands (the component owns no session, so it cannot observe assertion freshness); the obligation now sits explicitly with the host in `packages/identity/README.md` and `docs/THREAT_MODEL.md`.
 - **Evidence:** `begin("email_change", ...)` (`packages/identity/src/email-codes.ts:302-322`) requires only that the principal is active + email-verified. Proof of control of the **new** inbox (`finishEmailChange`) completes the change; the old address receives `old-address-notification` only after `effectState: "complete"` (`packages/identity/src/email-codes.ts:604-619`, `803-870`).
 - **Exploitability:** An attacker holding a hijacked session (sessions are out of component scope) can redirect email-code sign-in and recovery to an inbox they control. Bounded by: passkeys remain bound to the principal (victim retains passkey sign-in and can revert), and the old-address notification is a detective control.
 - **Recommendation:** Host guidance to require a fresh passkey assertion before `beginEmailChange`; confirm coverage in `docs/THREAT_MODEL.md`.
+- ✅ Resolved 2026-07-29 — README now requires hosts to authenticate the change endpoint for the named principal and to demand a fresh passkey assertion before `beginEmailChange`; the freshness gap and its bound are recorded as an invariant in `docs/THREAT_MODEL.md`. No code change: the component owns no session, so freshness is not observable here.
 
 ### F-03 — WebAuthn attestation is not verified
 
 - **Severity:** Informational
-- **Status:** Accepted design (confirm in threat model)
+- **Status:** Accepted design — confirmed in `docs/THREAT_MODEL.md` on 2026-07-29
 - **Evidence:** `attestationType: "none"` in `beginRegistration` (`packages/identity/src/passkeys.ts:785`). No authenticator-model/AAGUID policy is possible; software passkeys are permitted.
 - **Exploitability:** N/A for typical consumer passkey deployments; relevant only if a host assumes hardware-bound keys.
+- ✅ Resolved 2026-07-29 — the acceptance is now an explicit invariant in `docs/THREAT_MODEL.md`, stating that attestation is not verified, that software passkeys are accepted, and that hosts needing hardware-bound keys cannot get that assurance here.
 
 ### F-04 — Plaintext PII (email addresses) at rest
 
 - **Severity:** Informational
 - **Status:** Accepted design
 - **Evidence:** Email addresses are stored unhashed in `UserRecord.email`, `EmailIndexRecord.email`, `EmailCodeOperationRecord.targetEmail`/`oldEmail` (`packages/identity/src/records.ts:18-54`, `packages/identity/src/email-operation-records.ts:26-56`). Required so the Mail worker can deliver; hashes own lookup/uniqueness. At-rest protection is delegated to the storage layer.
+- ⚠️ Disputed 2026-07-29 — not a valid finding: a deliverable address is not a secret and cannot be hashed. `prepareMail` renders to `operation.targetEmail`/`oldEmail` and the Mail job's `recipientRef`, so a recoverable address is a functional requirement of asynchronous delivery, not an oversight. Lookup and uniqueness already run on domain-separated digests, the threat model treats email as attacker-knowable contact data (`docs/THREAT_MODEL.md:60`), and at-rest confidentiality sits with the storage adapter and operator (boundary 4). No defect and no residual action in this component.
 
 ### F-05 — Email codes are deterministic HMAC outputs, not random values
 
@@ -47,14 +51,16 @@ Findings are appended below in the order they were discovered during the scan.
 - **Status:** Accepted design — key-management dependency
 - **Evidence:** `createHmacEmailCodeProtector` (`packages/identity/src/crypto.ts:80-162`) derives the code as `HMAC(secret, handleHash ‖ block) mod 10^8`. The stored verifier is separately domain-separated (`email-codes.ts:331-343`). Code secrecy rests entirely on the host-owned HMAC secret; compromise of the secret exposes all in-TTL codes. Minimum 32-byte secret enforced (`crypto.ts:83-92`); secret zeroed after key import (`crypto.ts:102`).
 - **Positive observations (no action):** unbiased rejection sampling (`crypto.ts:104-127`), constant-time verifier compare (`crypto.ts:63-72`, `156-159`), 8-digit space bounded by `maxAttempts ≤ 10` + TTL ≤ 15 min (decoder invariants `email-operation-records.ts:245-247`) + dual rate limiters (`email-codes.ts:480-484`).
+- ⚠️ Disputed 2026-07-29 — not a valid finding: "deterministic" describes the derivation, not the guessability. The HMAC input is the digest of a fresh per-operation handle from `newId()` (`crypto.randomUUID()` by default, 122 bits), so each code is a PRF output over a random input and is uniformly distributed and unpredictable to anyone without the key — the same guarantee a CSPRNG code would give. Determinism is required so an asynchronous Mail worker can render a code that was never stored. The key-compromise dependency is inherent to any keyed scheme and is already an explicit invariant (`docs/THREAT_MODEL.md:111-118`) with a documented rotation procedure in the package README. No defect and no residual action.
 
 ### F-06 — `finishAccountCreation` silently doubles as email sign-in for existing accounts
 
 - **Severity:** Informational
-- **Status:** Accepted design — host-policy dependency
+- **Status:** Accepted design — host-policy dependency, documented in `packages/identity/README.md` on 2026-07-29
 - **Evidence:** When a code is verified for an email that already belongs to an active principal, `repair()` returns the existing user (`packages/identity/src/email-codes.ts:689-710`) and `finishAccountCreation` issues `VerifiedIdentityClaims` for that principal (`email-codes.ts:758-774`). The account-creation endpoint is therefore also a full sign-in endpoint.
 - **Exploitability:** None beyond the intended mailbox-control-equals-sign-in model, but a host that treats "signup" as lower-risk than "login" (weaker rate limiting, no session policy, no anomaly detection on the creation route) would under-protect a sign-in path.
 - **Recommendation:** State explicitly in the package README that the creation flow authenticates existing accounts and must carry the same endpoint policy as sign-in.
+- ✅ Resolved 2026-07-29 — README now states that `finishAccountCreation` returns an existing principal's claims and that the creation endpoint must carry the same rate limiting, session policy, and anomaly detection as `finishEmailSignIn`.
 
 ### F-07 — Timing side-channel distinguishes registered credential IDs
 
@@ -62,6 +68,7 @@ Findings are appended below in the order they were discovered during the scan.
 - **Status:** Accepted per threat model (credential IDs are not secrets)
 - **Evidence:** `finishAuthentication` returns via `verificationFailed(claim)` before `verifyAuthenticationResponse` when the credential ID is unknown (`packages/identity/src/passkeys.ts:936-962`); a registered ID proceeds through signature verification, a measurably more expensive path.
 - **Exploitability:** An attacker who already possesses a candidate credential ID can confirm its registration remotely. Credential IDs are random, non-enumerable authenticator outputs; the threat model (`docs/THREAT_MODEL.md:60`) explicitly treats them as non-secret. Residual value is negligible.
+- ⚠️ Disputed 2026-07-29 — not a valid finding: the oracle only confirms a value the attacker already holds, and it discloses neither a principal nor an account's existence, so it is below the Low bar in this repository's severity calibration. Each probe additionally costs one `beginPasskeyAuthentication` challenge — claimed and released per attempt (`passkeys.ts:952-962`, `745-755`) — under the authentication limiter. Equalizing the path would mean running a synthetic signature verification against a fabricated public key on every unknown credential, adding attacker-triggerable CPU cost and a new failure mode to protect a value the threat model declares non-secret (`docs/THREAT_MODEL.md:60`). Behavior is unchanged deliberately.
 
 ---
 
@@ -93,6 +100,17 @@ Findings are appended below in the order they were discovered during the scan.
 
 ### Suggested follow-ups (non-blocking)
 
-1. README: one line stating `claimsFor`/`repairUserByEmail` are privileged alongside `provisionVerifiedUser` (F-01).
-2. README: one line stating the account-creation flow authenticates existing accounts (F-06).
-3. Threat model: one line recording that attestation is not verified (`attestationType: "none"`, F-03) so the acceptance is explicit.
+1. README: one line stating `claimsFor`/`repairUserByEmail` are privileged alongside `provisionVerifiedUser` (F-01). — done 2026-07-29.
+2. README: one line stating the account-creation flow authenticates existing accounts (F-06). — done 2026-07-29.
+3. Threat model: one line recording that attestation is not verified (`attestationType: "none"`, F-03) so the acceptance is explicit. — done 2026-07-29.
+
+## Disposition review
+
+**Reviewed:** 2026-07-29
+
+Every finding was re-read against the implicated code before disposition.
+
+- **Resolved:** F-01, F-02, F-03, F-06 — operator-guidance gaps closed in `packages/identity/README.md` and `docs/THREAT_MODEL.md`. All three suggested follow-ups above are complete.
+- **Disputed:** F-04, F-05, F-07 — accurate observations that do not describe a weakness in this component; the reasoning is recorded on each item.
+
+No runtime source changed, so the public API and behavior of `@pegma/identity` are unchanged. The `0.1.1` patch release exists to ship the corrected package README to consumers.

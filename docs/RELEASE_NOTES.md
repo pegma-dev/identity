@@ -1,5 +1,34 @@
 # Release notes
 
+## 0.1.1
+
+`0.1.1` closes the operator-guidance findings from the 2026-07-28 repository
+security scan. It changes no runtime behavior and no public API; the packed
+`dist/` output is identical to `0.1.0`. The release exists so consumers
+receive the corrected package README.
+
+### Security documentation
+
+- `claimsFor` and `repairUserByEmail` are now named as privileged operations
+  alongside `provisionVerifiedUser`. None of the three may be reachable from
+  unauthenticated traffic or from a user-supplied `principalId` or email.
+- The account-creation flow is documented as also authenticating existing
+  accounts: `finishAccountCreation` returns an existing principal's claims,
+  so the creation endpoint needs sign-in-grade rate limiting, session policy,
+  and anomaly detection.
+- Email change now carries explicit host obligations: authenticate the
+  endpoint for the named principal, and require a fresh passkey assertion
+  before `beginEmailChange`. The old-address notification is a detective
+  control that arrives only after the change commits.
+- `docs/THREAT_MODEL.md` records two acceptances explicitly: authenticator
+  attestation is not verified (`attestationType: "none"`), and email-change
+  freshness is a host obligation rather than a component invariant.
+
+Three scan findings were reviewed and disputed as non-findings, with the
+reasoning kept in `docs/securityscan.md`: plaintext deliverable addresses at
+rest, deterministic HMAC-derived codes, and the credential-ID timing
+distinction in `finishPasskeyAuthentication`.
+
 ## 0.1.0
 
 `0.1.0` is the first advertised stable release of `@pegma/identity`. It

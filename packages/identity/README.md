@@ -102,6 +102,24 @@ fallback, and recovery do not disclose whether an address exists. Unknown
 fallback/recovery requests commit durable suppression records with the same
 request-path transaction shape; they can never become valid later.
 
+The creation flow also authenticates existing accounts. When the verified
+address already belongs to an active principal, `finishAccountCreation`
+returns that principal's claims instead of failing, because mailbox control
+is the same proof either way. Treat the creation endpoint as a sign-in
+endpoint: give it the same rate limiting, session policy, and anomaly
+detection as `finishEmailSignIn`, never a weaker "signup" policy.
+
+`beginEmailChange` and `finishEmailChange` are authenticated management
+operations. The host must prove the caller owns the named `principalId`
+before calling either; the library only checks that the principal is active
+and email-verified. Because mailbox control of the _new_ address completes
+the change, and the old address is notified only after the change commits,
+require a fresh passkey assertion — not merely a live session — immediately
+before `beginEmailChange`. Without that step-up, a stolen session can
+redirect email sign-in and recovery to an attacker-controlled inbox; the
+victim's passkeys stay bound to the principal, so passkey sign-in and a
+reverting change remain available.
+
 `emailCodeSecret` must contain at least 32 random bytes loaded from stable,
 host-managed secret storage on every process restart; never generate it during
 process startup. Pass a plain `Uint8Array`. Node callers that decode with
@@ -168,6 +186,12 @@ const claims = await identity.claimsFor(user.principalId);
 Do not expose `provisionVerifiedUser` directly as public signup. Normal
 account creation verifies an email code through `beginAccountCreation` and
 `finishAccountCreation`.
+`claimsFor` and `repairUserByEmail` are privileged in exactly the same sense:
+`claimsFor` mints verified claims for any active verified `PrincipalId`
+without proof of possession, and `repairUserByEmail` completes a reservation
+for any known address. None of these three methods may ever be reachable from
+unauthenticated traffic, or from a request whose `principalId` or email is
+taken from user input rather than from an already-authenticated context.
 The reserve/prepare/commit/activate protocol is durable across crashes;
 `repairUserByEmail` completes an interrupted operation. Concurrent equivalent
 emails converge on the one principal that won the structural reservation.
