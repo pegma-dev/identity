@@ -17,7 +17,7 @@ through the hardened GitHub Actions workflow using npm trusted publishing.
 The user/email-index model, durable email-code creation/fallback/recovery and
 email-change lifecycle, and passkey/challenge foundation are built and tested
 over memory plus real Azurite races. Mail delivery uses exact
-`@pegma/mail@0.1.0`; Identity owns the operation/Mail union required to commit
+`@pegma/mail@0.1.1`; Identity owns the operation/Mail union required to commit
 code state and delivery intent atomically. The threat model and hardened
 release scaffold gate every identity change.
 
@@ -181,8 +181,8 @@ breach; it gets the ceremony that deserves.
 
 One package: `packages/identity` publishing `@pegma/identity`.
 Dependencies: exact `@pegma/spine@0.1.1`,
-`@pegma/storage-core@0.4.0`, `@pegma/rate-limit@0.1.0`,
-`@pegma/mail@0.1.0`, and
+`@pegma/storage-core@0.4.0`, `@pegma/rate-limit@0.2.0`,
+`@pegma/mail@0.1.1`, and
 `@simplewebauthn/server@13.3.2`, `unicode-case-folding@1.1.1`,
 `unorm@1.6.0`, and `tr46@6.0.0`. Framework-free flows are functions the host's
 HTTP layer calls, same posture as every Pegma component.
