@@ -1,5 +1,15 @@
 # Release notes
 
+## 0.1.2
+
+`0.1.2` is a dependency-only alignment release. `@pegma/rate-limit` advances
+from `0.1.0` to `0.2.0` and `@pegma/mail` from `0.1.0` to `0.1.1`, so the
+dependency tree resolves a single `@pegma/storage-core@0.4.0` — previously
+rate-limit's transitive `storage-core@0.3.0` split hosts' trees into two
+incompatible `Store` types. Identity itself already required a storage-core
+`0.4.0` `Store`, so its composition contract, runtime behavior, and public
+API are unchanged.
+
 ## 0.1.1
 
 `0.1.1` closes the operator-guidance findings from the 2026-07-28 repository
