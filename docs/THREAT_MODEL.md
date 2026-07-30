@@ -86,6 +86,11 @@ Security invariants:
   the reservation; an active generation must cross-check the independently
   stored passkey mirror's owner, credential identity, generation, public key,
   transports, label, creation time, and counter.
+- Authenticator attestation is deliberately not verified. Registration uses
+  `attestationType: "none"`, so no authenticator-model or AAGUID policy is
+  expressed and software passkeys are accepted. This is the correct default
+  for consumer passkeys; a host that must assume hardware-bound keys cannot
+  obtain that assurance from this component.
 - Challenges are unpredictable, hashed at rest, short-lived, single-use,
   attempt-bounded, and version-conditionally swept through storage-core's
   authoritative bounded collection scan. The adapter returns at most the
@@ -119,6 +124,15 @@ Security invariants:
 - Email change is a repairable cross-collection saga. Old-address notification
   is atomically enqueued with completed operation state only after User and
   new-index agreement.
+- Email change carries no freshness requirement inside the component: it
+  verifies only that the named principal is active and email-verified, and
+  mailbox control of the new address completes it. Authenticating the
+  change endpoint for that principal and requiring a fresh passkey assertion
+  before `beginEmailChange` are host obligations, recorded in the package
+  README. The old-address notification is a detective control that arrives
+  only after the change commits, so a host that skips step-up leaves a
+  hijacked session able to redirect email sign-in and recovery, bounded by
+  the victim's retained passkeys.
 - Mail delivery is at least once. Provider idempotency keys fence ambiguous
   sends; authenticated callbacks are generation-fenced; dead-letter and
   terminal-unknown outcomes remain operator-visible until acknowledged.
