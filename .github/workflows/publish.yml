@@ -68,6 +68,9 @@ jobs:
       - name: Activate the reviewed package manager
         run: corepack prepare --activate
 
+      - name: Use the reviewed npm release
+        run: npm install --global npm@11.18.0 --registry https://registry.npmjs.org/
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --registry https://registry.npmjs.org/
 
@@ -75,7 +78,7 @@ jobs:
         run: pnpm run format:check && pnpm run check && pnpm test && pnpm audit --prod --audit-level=high
 
       - name: Prepare and verify the release tarball
-        run: pnpm run release:pack -- --require-clean --require-main-ancestor --require-release-tag --expected-release-commit "${RELEASE_COMMIT}"
+        run: node scripts/release-package.mjs pack --require-clean --require-main-ancestor --require-release-tag --expected-release-commit "${RELEASE_COMMIT}"
 
       - name: Upload the prepared release
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
@@ -117,11 +120,8 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
-      - name: Enable Corepack
-        run: corepack enable
-
-      - name: Activate the reviewed package manager
-        run: corepack prepare --activate
+      - name: Use the reviewed npm release
+        run: npm install --global npm@11.18.0 --registry https://registry.npmjs.org/
 
       - name: Verify the public npm registry
         run: test "$(npm config get registry)" = "https://registry.npmjs.org/"
@@ -133,4 +133,4 @@ jobs:
           path: .release
 
       - name: Publish the verified prepared tarball
-        run: pnpm run release:publish -- --expected-release-commit "${RELEASE_COMMIT}"
+        run: node scripts/release-package.mjs publish --expected-release-commit "${RELEASE_COMMIT}"

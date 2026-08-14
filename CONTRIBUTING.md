@@ -5,6 +5,7 @@ Read [AGENTS.md](AGENTS.md) and
 Pull requests must pass the complete gate on Node.js 22 and 24:
 
 ```sh
+corepack enable
 pnpm install --frozen-lockfile
 pnpm run format:check
 pnpm run check

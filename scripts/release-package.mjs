@@ -59,7 +59,7 @@ function run(command, arguments_, options = {}) {
   return result;
 }
 
-function runNpm(arguments_, options = {}) {
+export function runNpm(arguments_, options = {}) {
   return run(process.platform === "win32" ? "npm.cmd" : "npm", arguments_, {
     ...options,
     shell: process.platform === "win32",
@@ -142,7 +142,7 @@ export function parsePnpmLockfile(text) {
     fail("pnpm-lock.yaml is missing packages/identity dependencies");
   }
 
-  const specifiers = {};
+  const identityDependencies = {};
   const entryPattern =
     /^      ('[^']+'|[A-Za-z0-9@/._-]+):\n        specifier: (\S+)\n        version: (\S+)$/gmu;
   let entry;
@@ -151,9 +151,12 @@ export function parsePnpmLockfile(text) {
     if (name.startsWith("'") && name.endsWith("'")) {
       name = name.slice(1, -1);
     }
-    specifiers[name] = entry[2];
+    identityDependencies[name] = {
+      specifier: entry[2],
+      version: entry[3],
+    };
   }
-  if (Object.keys(specifiers).length === 0) {
+  if (Object.keys(identityDependencies).length === 0) {
     fail("pnpm-lock.yaml packages/identity dependencies are empty");
   }
 
@@ -166,9 +169,18 @@ export function parsePnpmLockfile(text) {
 
   return {
     lockfileVersion: version[1],
-    identitySpecifiers: specifiers,
+    identityDependencies,
     packagesBlock: packagesMatch[1],
   };
+}
+
+export function expectedLockPins(dependencies) {
+  return Object.fromEntries(
+    Object.entries(dependencies).map(([name, version]) => [
+      name,
+      { specifier: version, version },
+    ]),
+  );
 }
 
 function directDependencyLockEntry(lock, name, version) {
@@ -219,9 +231,11 @@ export function isolatedPublicNpmEnvironment(
 ) {
   const isolated = {};
   for (const [name, value] of Object.entries(environment)) {
-    if (!name.toLowerCase().startsWith("npm_config_")) {
-      isolated[name] = value;
+    const lower = name.toLowerCase();
+    if (lower.startsWith("npm_config_") || lower === "npm_execpath") {
+      continue;
     }
+    isolated[name] = value;
   }
   isolated.NPM_CONFIG_REGISTRY = PUBLIC_REGISTRY;
   isolated.NPM_CONFIG_USERCONFIG = userConfig;
@@ -249,6 +263,28 @@ async function publicNpmConfiguration() {
 
 function publicRegistryArguments(arguments_) {
   return [...arguments_, "--registry", PUBLIC_REGISTRY];
+}
+
+export function assertNpmSupportsTrustedPublishing(version) {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-.+)?$/u.exec(version);
+  if (match === null) {
+    fail(`could not parse npm version ${version}`);
+  }
+  const [, majorText, minorText, patchText] = match;
+  const [major, minor, patch] = [majorText, minorText, patchText].map(Number);
+  if (
+    major < 11 ||
+    (major === 11 && minor < 5) ||
+    (major === 11 && minor === 5 && patch < 1)
+  ) {
+    fail("trusted publishing requires npm 11.5.1 or newer");
+  }
+}
+
+export function requireTrustedPublishingNpm() {
+  assertNpmSupportsTrustedPublishing(
+    runNpm(["--version"], { capture: true }).stdout.trim(),
+  );
 }
 
 export function assertNormalReleaseVersion(version) {
@@ -389,7 +425,10 @@ export async function validateRepository(root = defaultRoot()) {
   }
   if (
     !sameJson(manifest.dependencies, REQUIRED_DEPENDENCIES) ||
-    !sameJson(lock.identitySpecifiers, REQUIRED_DEPENDENCIES)
+    !sameJson(
+      lock.identityDependencies,
+      expectedLockPins(REQUIRED_DEPENDENCIES),
+    )
   ) {
     fail("runtime dependencies must match the reviewed exact pins");
   }
@@ -498,6 +537,7 @@ async function pack(root, arguments_) {
       `release tag ${source.tag} does not match package version ${manifest.version}`,
     );
   }
+  requireTrustedPublishingNpm();
   const npmConfiguration = await publicNpmConfiguration();
   try {
     runPnpm(
@@ -604,6 +644,7 @@ async function readAndVerifyReceipt(root, arguments_) {
 
 async function registryCheck(root, arguments_) {
   const { receipt } = await readAndVerifyReceipt(root, arguments_);
+  requireTrustedPublishingNpm();
   const npmConfiguration = await publicNpmConfiguration();
   let result;
   try {
@@ -641,6 +682,7 @@ async function registryCheck(root, arguments_) {
 async function publish(root, arguments_) {
   const { receipt, tarball } = await readAndVerifyReceipt(root, arguments_);
   assertNormalReleaseVersion(receipt.version);
+  requireTrustedPublishingNpm();
   const npmConfiguration = await publicNpmConfiguration();
   try {
     runNpm(

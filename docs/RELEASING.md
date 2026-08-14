@@ -97,10 +97,10 @@ deliberately refuses `0.0.0`.
 
 ## Normal release
 
-A release pull request updates the root, package, and lockfile versions,
-status documentation, and release notes, then passes the complete gate on Node
-22 and 24. After merge, create and verify a protected signed annotated tag on
-the exact `origin/main` commit:
+A release pull request updates the root, package, and `pnpm-lock.yaml`
+versions, status documentation, and release notes, then passes the complete
+gate on Node 22 and 24. After merge, create and verify a protected signed
+annotated tag on the exact `origin/main` commit:
 
 ```sh
 git fetch origin
@@ -124,6 +124,9 @@ keeps its configured allowed action.
 
 The unprivileged preparation job verifies the signed tag, release-event
 commit, main ancestry, full gate, production audit, package inventory,
-consumer import, and hashes. Only the environment-scoped publish job receives
-OIDC authority; it installs no dependencies and publishes the downloaded
-prepared artifact with provenance.
+consumer import, and hashes. It activates the reviewed pnpm via Corepack and
+installs the reviewed `npm@11.18.0` for pack, registry view, and the trusted
+publishing version gate. Only the environment-scoped publish job receives
+OIDC authority; it installs no workspace dependencies, does not download
+Corepack pnpm, and publishes the downloaded prepared artifact with
+`node scripts/release-package.mjs publish`.

@@ -38,6 +38,15 @@ One honest admission, stated rather than buried: an account recoverable by
 emailed code is exactly as secure as the mailbox behind it. Every consumer
 service works this way; almost none say it. We say it.
 
+## Development
+
+```sh
+corepack enable
+pnpm install --frozen-lockfile
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete gate.
+
 ## License
 
 MIT © RetireGolden, LLC
