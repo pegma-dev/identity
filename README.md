@@ -38,6 +38,19 @@ One honest admission, stated rather than buried: an account recoverable by
 emailed code is exactly as secure as the mailbox behind it. Every consumer
 service works this way; almost none say it. We say it.
 
+## Development
+
+```sh
+npm install -g corepack
+corepack enable
+pnpm install --frozen-lockfile
+```
+
+The gate runs on Node.js 22 and 24, where Corepack is bundled. On Node 25 or
+newer, install Corepack before enabling it.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete gate.
+
 ## License
 
 MIT © RetireGolden, LLC

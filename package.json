@@ -5,13 +5,10 @@
   "description": "Passkeys-first, passwordless first-party identity for Pegma hosts.",
   "license": "MIT",
   "type": "module",
-  "packageManager": "npm@11.18.0",
+  "packageManager": "pnpm@10.34.5",
   "engines": {
     "node": ">=22"
   },
-  "workspaces": [
-    "packages/*"
-  ],
   "scripts": {
     "build": "tsc -b",
     "check": "tsc -b --pretty false && tsc -p tsconfig.test.json --pretty false",
@@ -22,7 +19,7 @@
     "release:pack": "node scripts/release-package.mjs pack",
     "release:publish": "node scripts/release-package.mjs publish",
     "release:registry:check": "node scripts/release-package.mjs registry-check",
-    "test": "npm run build && node --test scripts/*.test.mjs && vitest run"
+    "test": "pnpm run build && node --test scripts/*.test.mjs && vitest run"
   },
   "devDependencies": {
     "@azure/data-tables": "13.3.1",

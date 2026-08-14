@@ -212,7 +212,7 @@ Dependency and release compromise matter because this library executes in an
 authentication path. Runtime versions are exact, the lockfile is reviewed,
 and every direct runtime lock entry requires public-registry provenance and
 SHA-512 integrity. Release operations isolate npm config and explicitly
-override hostile inherited registries. `npm audit` gates preparation, CI
+override hostile inherited registries. `pnpm audit` gates preparation, CI
 actions are SHA-pinned, Node 22 and 24 run the complete gate, package contents
 are allowlisted, tests are excluded from the tarball, and publishing uses a
 prepared artifact with trusted-publisher OIDC. A bootstrap `0.0.0` exists only

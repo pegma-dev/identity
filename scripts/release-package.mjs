@@ -16,7 +16,9 @@ import { fileURLToPath } from "node:url";
 const PACKAGE_NAME = "@pegma/identity";
 const PACKAGE_DIRECTORY = "packages/identity";
 const REPOSITORY_URL = "git+https://github.com/pegma-dev/identity.git";
-const PACKAGE_MANAGER = "npm@11.18.0";
+const PACKAGE_MANAGER = "pnpm@10.34.5";
+const PNPM_LOCKFILE_VERSION = "9.0";
+const WORKSPACE_GLOBS = ["packages/*"];
 const NODE_RANGE = ">=22";
 const PUBLIC_REGISTRY = "https://registry.npmjs.org/";
 const REQUIRED_DEPENDENCIES = {
@@ -57,12 +59,15 @@ function run(command, arguments_, options = {}) {
   return result;
 }
 
-function runNpm(arguments_, options = {}) {
-  const npmExecPath = process.env.npm_execpath;
-  if (npmExecPath !== undefined) {
-    return run(process.execPath, [npmExecPath, ...arguments_], options);
-  }
+export function runNpm(arguments_, options = {}) {
   return run(process.platform === "win32" ? "npm.cmd" : "npm", arguments_, {
+    ...options,
+    shell: process.platform === "win32",
+  });
+}
+
+function runPnpm(arguments_, options = {}) {
+  return run(process.platform === "win32" ? "pnpm.cmd" : "pnpm", arguments_, {
     ...options,
     shell: process.platform === "win32",
   });
@@ -80,12 +85,294 @@ function sameJson(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function parsePnpmWorkspace(text) {
+  const packages = [];
+  const lines = text.split(/\r?\n/u);
+  if (lines[0] !== "packages:") {
+    fail("pnpm-workspace.yaml is invalid");
+  }
+  for (const line of lines.slice(1)) {
+    if (line === "") {
+      continue;
+    }
+    const match = /^  - ["']([^"']+)["']$/u.exec(line);
+    if (match === null) {
+      fail("pnpm-workspace.yaml is invalid");
+    }
+    packages.push(match[1]);
+  }
+  if (packages.length === 0) {
+    fail("pnpm-workspace.yaml is invalid");
+  }
+  return packages;
+}
+
+function parseResolutionMapping(body) {
+  const fields = {};
+  for (const part of body.split(",")) {
+    const match = /^\s*([A-Za-z][A-Za-z0-9]*)\s*:\s*(.+?)\s*$/u.exec(part);
+    if (match === null) {
+      fail("pnpm-lock.yaml resolution mapping is invalid");
+    }
+    let value = match[2];
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    fields[match[1]] = value;
+  }
+  return fields;
+}
+
+export function decodeYamlScalar(raw) {
+  if (typeof raw !== "string") {
+    return raw;
+  }
+  const value = raw.trim();
+  if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
+    return value.slice(1, -1).replaceAll("''", "'");
+  }
+  if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+    return value.slice(1, -1).replace(/\\(["\\])/gu, "$1");
+  }
+  return value;
+}
+
+export function lockResolvedVersion(version) {
+  const decoded = decodeYamlScalar(version);
+  if (typeof decoded !== "string" || decoded.length === 0) {
+    return decoded;
+  }
+  return /^(\S+?)(?:\(|$)/u.exec(decoded)?.[1] ?? decoded;
+}
+
+function parseSemver(version) {
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u.exec(version);
+  if (match === null) {
+    return null;
+  }
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+  };
+}
+
+function compareSemver(left, right) {
+  return (
+    left.major - right.major ||
+    left.minor - right.minor ||
+    left.patch - right.patch
+  );
+}
+
+export function versionSatisfiesSpecifier(version, specifier) {
+  const resolved = lockResolvedVersion(version);
+  const spec = decodeYamlScalar(specifier);
+  if (typeof resolved !== "string" || typeof spec !== "string") {
+    return false;
+  }
+  if (spec === "*" || spec === "x") {
+    return parseSemver(resolved) !== null;
+  }
+  if (parseSemver(spec) !== null) {
+    return resolved === spec;
+  }
+  const majorOnly = /^(0|[1-9]\d*)$/u.exec(spec);
+  if (majorOnly !== null) {
+    const actual = parseSemver(resolved);
+    return actual !== null && actual.major === Number(majorOnly[1]);
+  }
+  const majorMinor = /^(0|[1-9]\d*)\.(0|[1-9]\d*)$/u.exec(spec);
+  if (majorMinor !== null) {
+    const actual = parseSemver(resolved);
+    return (
+      actual !== null &&
+      actual.major === Number(majorMinor[1]) &&
+      actual.minor === Number(majorMinor[2])
+    );
+  }
+  const caret = /^\^((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))$/u.exec(
+    spec,
+  );
+  if (caret !== null) {
+    const minimum = parseSemver(caret[1]);
+    const actual = parseSemver(resolved);
+    if (
+      minimum === null ||
+      actual === null ||
+      compareSemver(actual, minimum) < 0
+    ) {
+      return false;
+    }
+    if (minimum.major > 0) {
+      return actual.major === minimum.major;
+    }
+    if (minimum.minor > 0) {
+      return actual.major === 0 && actual.minor === minimum.minor;
+    }
+    return (
+      actual.major === 0 && actual.minor === 0 && actual.patch === minimum.patch
+    );
+  }
+  const tilde = /^~((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))$/u.exec(
+    spec,
+  );
+  if (tilde !== null) {
+    const minimum = parseSemver(tilde[1]);
+    const actual = parseSemver(resolved);
+    return (
+      minimum !== null &&
+      actual !== null &&
+      compareSemver(actual, minimum) >= 0 &&
+      actual.major === minimum.major &&
+      actual.minor === minimum.minor
+    );
+  }
+  return false;
+}
+
+export function lockEntryMatchesDeclared(entry, declaredSpecifier) {
+  if (
+    entry === undefined ||
+    typeof entry.specifier !== "string" ||
+    typeof entry.version !== "string"
+  ) {
+    return false;
+  }
+  if (
+    decodeYamlScalar(entry.specifier) !== decodeYamlScalar(declaredSpecifier)
+  ) {
+    return false;
+  }
+  return versionSatisfiesSpecifier(entry.version, declaredSpecifier);
+}
+
+function parseImporterSection(block, section) {
+  const sectionMatch = new RegExp(
+    `^    ${section}:\\n((?:      .+\\n)+)`,
+    "mu",
+  ).exec(block);
+  if (sectionMatch === null) {
+    return {};
+  }
+  const entries = {};
+  const entryPattern =
+    /^      (\S[^:]*):\n        specifier: (\S+)\n        version: (\S+)$/gmu;
+  let entry;
+  while ((entry = entryPattern.exec(sectionMatch[1])) !== null) {
+    entries[decodeYamlScalar(entry[1])] = {
+      specifier: decodeYamlScalar(entry[2]),
+      version: decodeYamlScalar(entry[3]),
+    };
+  }
+  return entries;
+}
+
+export function parsePnpmLockfile(text) {
+  const version = /^lockfileVersion:\s*['"]([^'"]+)['"]\s*$/mu.exec(text);
+  if (version === null) {
+    fail("pnpm-lock.yaml is missing lockfileVersion");
+  }
+
+  const importerMatch = /^  packages\/identity:\n((?:    .+\n)+)/mu.exec(text);
+  if (importerMatch === null) {
+    fail("pnpm-lock.yaml is missing packages/identity");
+  }
+
+  const identityDependencies = parseImporterSection(
+    importerMatch[1],
+    "dependencies",
+  );
+  const identityPeerDependencies = parseImporterSection(
+    importerMatch[1],
+    "peerDependencies",
+  );
+  if (Object.keys(identityDependencies).length === 0) {
+    fail("pnpm-lock.yaml packages/identity dependencies are empty");
+  }
+
+  const packagesMatch = /^packages:\n\n([\s\S]*?)\n(?=snapshots:\n)/mu.exec(
+    text,
+  );
+  if (packagesMatch === null) {
+    fail("pnpm-lock.yaml is missing the packages catalog");
+  }
+
+  return {
+    lockfileVersion: version[1],
+    identityDependencies,
+    identityPeerDependencies,
+    packagesBlock: packagesMatch[1],
+  };
+}
+
+export function expectedLockPins(dependencies) {
+  return Object.fromEntries(
+    Object.entries(dependencies).map(([name, version]) => [
+      name,
+      { specifier: version, version },
+    ]),
+  );
+}
+
+function assertLockSectionMatches(locked, declared, label) {
+  const names = new Set([...Object.keys(declared), ...Object.keys(locked)]);
+  for (const name of names) {
+    if (
+      declared[name] === undefined ||
+      !lockEntryMatchesDeclared(locked[name], declared[name])
+    ) {
+      fail(`${label} must match reviewed specifiers and resolved versions`);
+    }
+  }
+}
+
 function directDependencyLockEntry(lock, name, version) {
-  const candidates = [
-    lock.packages?.[`${PACKAGE_DIRECTORY}/node_modules/${name}`],
-    lock.packages?.[`node_modules/${name}`],
-  ];
-  return candidates.find((entry) => entry?.version === version);
+  const key = `${name}@${version}`;
+  const pattern = new RegExp(
+    `^  (?:'${escapeRegExp(key)}'|${escapeRegExp(key)}):\n    resolution: \\{([^}\\n]+)\\}`,
+    "mu",
+  );
+  const match = pattern.exec(lock.packagesBlock);
+  if (match === null) {
+    return undefined;
+  }
+  return parseResolutionMapping(match[1]);
+}
+
+function assertPublicRegistryLockEntry(name, version, dependency) {
+  const fields = dependency === undefined ? [] : Object.keys(dependency);
+  if (
+    dependency === undefined ||
+    typeof dependency.integrity !== "string" ||
+    !dependency.integrity.startsWith("sha512-") ||
+    fields.some((field) => field !== "integrity" && field !== "tarball") ||
+    (dependency.tarball !== undefined &&
+      !dependency.tarball.startsWith(PUBLIC_REGISTRY))
+  ) {
+    fail(
+      `direct runtime dependency ${name}@${version} lacks public-registry provenance`,
+    );
+  }
+}
+
+async function assertAbsentLockfile(root, filename) {
+  try {
+    await stat(join(root, filename));
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+  fail(`${filename} must not be present`);
 }
 
 export function isolatedPublicNpmEnvironment(
@@ -95,9 +382,11 @@ export function isolatedPublicNpmEnvironment(
 ) {
   const isolated = {};
   for (const [name, value] of Object.entries(environment)) {
-    if (!name.toLowerCase().startsWith("npm_config_")) {
-      isolated[name] = value;
+    const lower = name.toLowerCase();
+    if (lower.startsWith("npm_config_") || lower === "npm_execpath") {
+      continue;
     }
+    isolated[name] = value;
   }
   isolated.NPM_CONFIG_REGISTRY = PUBLIC_REGISTRY;
   isolated.NPM_CONFIG_USERCONFIG = userConfig;
@@ -125,6 +414,28 @@ async function publicNpmConfiguration() {
 
 function publicRegistryArguments(arguments_) {
   return [...arguments_, "--registry", PUBLIC_REGISTRY];
+}
+
+export function assertNpmSupportsTrustedPublishing(version) {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-.+)?$/u.exec(version);
+  if (match === null) {
+    fail(`could not parse npm version ${version}`);
+  }
+  const [, majorText, minorText, patchText] = match;
+  const [major, minor, patch] = [majorText, minorText, patchText].map(Number);
+  if (
+    major < 11 ||
+    (major === 11 && minor < 5) ||
+    (major === 11 && minor === 5 && patch < 1)
+  ) {
+    fail("trusted publishing requires npm 11.5.1 or newer");
+  }
+}
+
+export function requireTrustedPublishingNpm() {
+  assertNpmSupportsTrustedPublishing(
+    runNpm(["--version"], { capture: true }).stdout.trim(),
+  );
 }
 
 export function assertNormalReleaseVersion(version) {
@@ -219,8 +530,14 @@ export async function validateRepository(root = defaultRoot()) {
   const manifest = await readJson(
     join(root, PACKAGE_DIRECTORY, "package.json"),
   );
-  const lock = await readJson(join(root, "package-lock.json"));
-  const lockEntry = lock.packages?.[PACKAGE_DIRECTORY];
+  const workspace = parsePnpmWorkspace(
+    await readFile(join(root, "pnpm-workspace.yaml"), "utf8"),
+  );
+  const lock = parsePnpmLockfile(
+    await readFile(join(root, "pnpm-lock.yaml"), "utf8"),
+  );
+  await assertAbsentLockfile(root, "package-lock.json");
+  await assertAbsentLockfile(root, "yarn.lock");
   const packageDirectories = (
     await readdir(join(root, "packages"), { withFileTypes: true })
   )
@@ -232,9 +549,12 @@ export async function validateRepository(root = defaultRoot()) {
     rootManifest.name !== "identity" ||
     rootManifest.private !== true ||
     rootManifest.packageManager !== PACKAGE_MANAGER ||
-    !sameJson(rootManifest.workspaces, ["packages/*"])
+    !sameJson(workspace, WORKSPACE_GLOBS)
   ) {
     fail("the private root workspace metadata is invalid");
+  }
+  if (lock.lockfileVersion !== PNPM_LOCKFILE_VERSION) {
+    fail("pnpm-lock.yaml lockfileVersion is not the reviewed format");
   }
   if (!sameJson(packageDirectories, ["identity"])) {
     fail("the public workspace inventory must contain only packages/identity");
@@ -254,30 +574,34 @@ export async function validateRepository(root = defaultRoot()) {
   ) {
     fail(`${PACKAGE_DIRECTORY}/package.json has invalid public metadata`);
   }
-  if (
-    !sameJson(manifest.dependencies, REQUIRED_DEPENDENCIES) ||
-    !sameJson(lockEntry?.dependencies, REQUIRED_DEPENDENCIES)
-  ) {
+  if (!sameJson(manifest.dependencies, REQUIRED_DEPENDENCIES)) {
     fail("runtime dependencies must match the reviewed exact pins");
   }
-  for (const [name, version] of Object.entries(REQUIRED_DEPENDENCIES)) {
-    const dependency = directDependencyLockEntry(lock, name, version);
-    if (
-      dependency === undefined ||
-      typeof dependency.resolved !== "string" ||
-      !dependency.resolved.startsWith("https://registry.npmjs.org/") ||
-      typeof dependency.integrity !== "string" ||
-      !dependency.integrity.startsWith("sha512-")
-    ) {
-      fail(
-        `direct runtime dependency ${name}@${version} lacks public-registry provenance`,
-      );
-    }
+  assertLockSectionMatches(
+    lock.identityDependencies,
+    REQUIRED_DEPENDENCIES,
+    "pnpm-lock.yaml packages/identity dependencies",
+  );
+  assertLockSectionMatches(
+    lock.identityPeerDependencies,
+    manifest.peerDependencies ?? {},
+    "pnpm-lock.yaml packages/identity peerDependencies",
+  );
+  for (const [name, declared] of Object.entries({
+    ...REQUIRED_DEPENDENCIES,
+    ...(manifest.peerDependencies ?? {}),
+  })) {
+    const entry =
+      lock.identityDependencies[name] ?? lock.identityPeerDependencies[name];
+    const resolved = lockResolvedVersion(entry.version);
+    assertPublicRegistryLockEntry(
+      name,
+      resolved,
+      directDependencyLockEntry(lock, name, resolved),
+    );
   }
   if (
-    lockEntry?.name !== PACKAGE_NAME ||
-    lockEntry.version !== manifest.version ||
-    manifest.scripts?.prepack !== "npm run build" ||
+    manifest.scripts?.prepack !== "pnpm run build" ||
     !sameJson(manifest.files, [
       "dist/**/*.d.ts",
       "dist/**/*.d.ts.map",
@@ -300,7 +624,7 @@ export async function validateRepository(root = defaultRoot()) {
       fail(`${PACKAGE_DIRECTORY}/${required} is required`);
     }
   }
-  return { manifest, lockEntry };
+  return { manifest, lock };
 }
 
 function validatePackedFiles(files) {
@@ -374,10 +698,11 @@ async function pack(root, arguments_) {
       `release tag ${source.tag} does not match package version ${manifest.version}`,
     );
   }
+  requireTrustedPublishingNpm();
   const npmConfiguration = await publicNpmConfiguration();
   try {
-    runNpm(
-      publicRegistryArguments(["audit", "--omit=dev", "--audit-level=high"]),
+    runPnpm(
+      publicRegistryArguments(["audit", "--prod", "--audit-level=high"]),
       {
         cwd: root,
         env: npmConfiguration.environment,
@@ -480,6 +805,7 @@ async function readAndVerifyReceipt(root, arguments_) {
 
 async function registryCheck(root, arguments_) {
   const { receipt } = await readAndVerifyReceipt(root, arguments_);
+  requireTrustedPublishingNpm();
   const npmConfiguration = await publicNpmConfiguration();
   let result;
   try {
@@ -517,6 +843,7 @@ async function registryCheck(root, arguments_) {
 async function publish(root, arguments_) {
   const { receipt, tarball } = await readAndVerifyReceipt(root, arguments_);
   assertNormalReleaseVersion(receipt.version);
+  requireTrustedPublishingNpm();
   const npmConfiguration = await publicNpmConfiguration();
   try {
     runNpm(
