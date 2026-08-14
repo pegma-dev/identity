@@ -130,32 +130,170 @@ function parseResolutionMapping(body) {
   return fields;
 }
 
+export function decodeYamlScalar(raw) {
+  if (typeof raw !== "string") {
+    return raw;
+  }
+  const value = raw.trim();
+  if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
+    return value.slice(1, -1).replaceAll("''", "'");
+  }
+  if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+    return value.slice(1, -1).replace(/\\(["\\])/gu, "$1");
+  }
+  return value;
+}
+
+export function lockResolvedVersion(version) {
+  const decoded = decodeYamlScalar(version);
+  if (typeof decoded !== "string" || decoded.length === 0) {
+    return decoded;
+  }
+  return /^(\S+?)(?:\(|$)/u.exec(decoded)?.[1] ?? decoded;
+}
+
+function parseSemver(version) {
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u.exec(version);
+  if (match === null) {
+    return null;
+  }
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+  };
+}
+
+function compareSemver(left, right) {
+  return (
+    left.major - right.major ||
+    left.minor - right.minor ||
+    left.patch - right.patch
+  );
+}
+
+export function versionSatisfiesSpecifier(version, specifier) {
+  const resolved = lockResolvedVersion(version);
+  const spec = decodeYamlScalar(specifier);
+  if (typeof resolved !== "string" || typeof spec !== "string") {
+    return false;
+  }
+  if (spec === "*" || spec === "x") {
+    return parseSemver(resolved) !== null;
+  }
+  if (parseSemver(spec) !== null) {
+    return resolved === spec;
+  }
+  const majorOnly = /^(0|[1-9]\d*)$/u.exec(spec);
+  if (majorOnly !== null) {
+    const actual = parseSemver(resolved);
+    return actual !== null && actual.major === Number(majorOnly[1]);
+  }
+  const majorMinor = /^(0|[1-9]\d*)\.(0|[1-9]\d*)$/u.exec(spec);
+  if (majorMinor !== null) {
+    const actual = parseSemver(resolved);
+    return (
+      actual !== null &&
+      actual.major === Number(majorMinor[1]) &&
+      actual.minor === Number(majorMinor[2])
+    );
+  }
+  const caret = /^\^((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))$/u.exec(
+    spec,
+  );
+  if (caret !== null) {
+    const minimum = parseSemver(caret[1]);
+    const actual = parseSemver(resolved);
+    if (
+      minimum === null ||
+      actual === null ||
+      compareSemver(actual, minimum) < 0
+    ) {
+      return false;
+    }
+    if (minimum.major > 0) {
+      return actual.major === minimum.major;
+    }
+    if (minimum.minor > 0) {
+      return actual.major === 0 && actual.minor === minimum.minor;
+    }
+    return (
+      actual.major === 0 && actual.minor === 0 && actual.patch === minimum.patch
+    );
+  }
+  const tilde = /^~((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))$/u.exec(
+    spec,
+  );
+  if (tilde !== null) {
+    const minimum = parseSemver(tilde[1]);
+    const actual = parseSemver(resolved);
+    return (
+      minimum !== null &&
+      actual !== null &&
+      compareSemver(actual, minimum) >= 0 &&
+      actual.major === minimum.major &&
+      actual.minor === minimum.minor
+    );
+  }
+  return false;
+}
+
+export function lockEntryMatchesDeclared(entry, declaredSpecifier) {
+  if (
+    entry === undefined ||
+    typeof entry.specifier !== "string" ||
+    typeof entry.version !== "string"
+  ) {
+    return false;
+  }
+  if (
+    decodeYamlScalar(entry.specifier) !== decodeYamlScalar(declaredSpecifier)
+  ) {
+    return false;
+  }
+  return versionSatisfiesSpecifier(entry.version, declaredSpecifier);
+}
+
+function parseImporterSection(block, section) {
+  const sectionMatch = new RegExp(
+    `^    ${section}:\\n((?:      .+\\n)+)`,
+    "mu",
+  ).exec(block);
+  if (sectionMatch === null) {
+    return {};
+  }
+  const entries = {};
+  const entryPattern =
+    /^      (\S[^:]*):\n        specifier: (\S+)\n        version: (\S+)$/gmu;
+  let entry;
+  while ((entry = entryPattern.exec(sectionMatch[1])) !== null) {
+    entries[decodeYamlScalar(entry[1])] = {
+      specifier: decodeYamlScalar(entry[2]),
+      version: decodeYamlScalar(entry[3]),
+    };
+  }
+  return entries;
+}
+
 export function parsePnpmLockfile(text) {
   const version = /^lockfileVersion:\s*['"]([^'"]+)['"]\s*$/mu.exec(text);
   if (version === null) {
     fail("pnpm-lock.yaml is missing lockfileVersion");
   }
 
-  const importerMatch =
-    /^  packages\/identity:\n    dependencies:\n((?:      .+\n)+)/mu.exec(text);
+  const importerMatch = /^  packages\/identity:\n((?:    .+\n)+)/mu.exec(text);
   if (importerMatch === null) {
-    fail("pnpm-lock.yaml is missing packages/identity dependencies");
+    fail("pnpm-lock.yaml is missing packages/identity");
   }
 
-  const identityDependencies = {};
-  const entryPattern =
-    /^      ('[^']+'|[A-Za-z0-9@/._-]+):\n        specifier: (\S+)\n        version: (\S+)$/gmu;
-  let entry;
-  while ((entry = entryPattern.exec(importerMatch[1])) !== null) {
-    let name = entry[1];
-    if (name.startsWith("'") && name.endsWith("'")) {
-      name = name.slice(1, -1);
-    }
-    identityDependencies[name] = {
-      specifier: entry[2],
-      version: entry[3],
-    };
-  }
+  const identityDependencies = parseImporterSection(
+    importerMatch[1],
+    "dependencies",
+  );
+  const identityPeerDependencies = parseImporterSection(
+    importerMatch[1],
+    "peerDependencies",
+  );
   if (Object.keys(identityDependencies).length === 0) {
     fail("pnpm-lock.yaml packages/identity dependencies are empty");
   }
@@ -170,6 +308,7 @@ export function parsePnpmLockfile(text) {
   return {
     lockfileVersion: version[1],
     identityDependencies,
+    identityPeerDependencies,
     packagesBlock: packagesMatch[1],
   };
 }
@@ -181,6 +320,18 @@ export function expectedLockPins(dependencies) {
       { specifier: version, version },
     ]),
   );
+}
+
+function assertLockSectionMatches(locked, declared, label) {
+  const names = new Set([...Object.keys(declared), ...Object.keys(locked)]);
+  for (const name of names) {
+    if (
+      declared[name] === undefined ||
+      !lockEntryMatchesDeclared(locked[name], declared[name])
+    ) {
+      fail(`${label} must match reviewed specifiers and resolved versions`);
+    }
+  }
 }
 
 function directDependencyLockEntry(lock, name, version) {
@@ -423,20 +574,30 @@ export async function validateRepository(root = defaultRoot()) {
   ) {
     fail(`${PACKAGE_DIRECTORY}/package.json has invalid public metadata`);
   }
-  if (
-    !sameJson(manifest.dependencies, REQUIRED_DEPENDENCIES) ||
-    !sameJson(
-      lock.identityDependencies,
-      expectedLockPins(REQUIRED_DEPENDENCIES),
-    )
-  ) {
+  if (!sameJson(manifest.dependencies, REQUIRED_DEPENDENCIES)) {
     fail("runtime dependencies must match the reviewed exact pins");
   }
-  for (const [name, version] of Object.entries(REQUIRED_DEPENDENCIES)) {
+  assertLockSectionMatches(
+    lock.identityDependencies,
+    REQUIRED_DEPENDENCIES,
+    "pnpm-lock.yaml packages/identity dependencies",
+  );
+  assertLockSectionMatches(
+    lock.identityPeerDependencies,
+    manifest.peerDependencies ?? {},
+    "pnpm-lock.yaml packages/identity peerDependencies",
+  );
+  for (const [name, declared] of Object.entries({
+    ...REQUIRED_DEPENDENCIES,
+    ...(manifest.peerDependencies ?? {}),
+  })) {
+    const entry =
+      lock.identityDependencies[name] ?? lock.identityPeerDependencies[name];
+    const resolved = lockResolvedVersion(entry.version);
     assertPublicRegistryLockEntry(
       name,
-      version,
-      directDependencyLockEntry(lock, name, version),
+      resolved,
+      directDependencyLockEntry(lock, name, resolved),
     );
   }
   if (

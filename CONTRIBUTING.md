@@ -5,6 +5,7 @@ Read [AGENTS.md](AGENTS.md) and
 Pull requests must pass the complete gate on Node.js 22 and 24:
 
 ```sh
+npm install -g corepack
 corepack enable
 pnpm install --frozen-lockfile
 pnpm run format:check
@@ -12,6 +13,9 @@ pnpm run check
 pnpm test
 pnpm audit --prod --audit-level=high
 ```
+
+Corepack is bundled with Node.js 22 and 24. On Node 25 or newer, the
+`npm install -g corepack` step is required before `corepack enable`.
 
 `pnpm test` starts Azurite. Identity uniqueness, repair, challenge consumption,
 and counter transitions must agree between the memory store and the real

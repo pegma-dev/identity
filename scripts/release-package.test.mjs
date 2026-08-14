@@ -6,11 +6,13 @@ import { spawnSync } from "node:child_process";
 import {
   assertNormalReleaseVersion,
   assertNpmSupportsTrustedPublishing,
-  expectedLockPins,
+  decodeYamlScalar,
   isolatedPublicNpmEnvironment,
+  lockEntryMatchesDeclared,
   parsePnpmLockfile,
   parsePnpmWorkspace,
   runNpm,
+  versionSatisfiesSpecifier,
 } from "./release-package.mjs";
 
 test("normal releases reject every stable version below 0.1.0", () => {
@@ -89,9 +91,68 @@ snapshots:
     version: "999.0.0",
   });
   assert.equal(
-    JSON.stringify(lock.identityDependencies) ===
-      JSON.stringify(expectedLockPins({ "@pegma/mail": "0.1.1" })),
+    lockEntryMatchesDeclared(lock.identityDependencies["@pegma/mail"], "0.1.1"),
     false,
+  );
+});
+
+test("lockfile sync accepts resolved versions that satisfy semver ranges", () => {
+  assert.equal(versionSatisfiesSpecifier("1.2.3", "^1.2.0"), true);
+  assert.equal(versionSatisfiesSpecifier("1.2.3", "~1.2.0"), true);
+  assert.equal(versionSatisfiesSpecifier("2.0.0", "^1.2.0"), false);
+  assert.equal(versionSatisfiesSpecifier("0.1.1", "0.1.1"), true);
+  assert.equal(versionSatisfiesSpecifier("999.0.0", "0.1.1"), false);
+  assert.equal(
+    lockEntryMatchesDeclared(
+      { specifier: "^1.2.0", version: "1.2.3" },
+      "^1.2.0",
+    ),
+    true,
+  );
+});
+
+test("lockfile parser unquotes YAML scalars before comparing", () => {
+  assert.equal(decodeYamlScalar("'*'"), "*");
+  assert.equal(decodeYamlScalar("'1'"), "1");
+  assert.equal(decodeYamlScalar('"1.2.3"'), "1.2.3");
+
+  const lock = parsePnpmLockfile(`lockfileVersion: '9.0'
+
+importers:
+
+  packages/identity:
+    dependencies:
+      b:
+        specifier: '1'
+        version: '1.0.0'
+    peerDependencies:
+      '@types/node':
+        specifier: '*'
+        version: 26.1.1
+
+packages:
+
+  b@1.0.0:
+    resolution: {integrity: sha512-b==}
+
+snapshots:
+`);
+
+  assert.deepEqual(lock.identityDependencies.b, {
+    specifier: "1",
+    version: "1.0.0",
+  });
+  assert.deepEqual(lock.identityPeerDependencies["@types/node"], {
+    specifier: "*",
+    version: "26.1.1",
+  });
+  assert.equal(
+    lockEntryMatchesDeclared(lock.identityDependencies.b, "1"),
+    true,
+  );
+  assert.equal(
+    lockEntryMatchesDeclared(lock.identityPeerDependencies["@types/node"], "*"),
+    true,
   );
 });
 
