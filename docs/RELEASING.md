@@ -7,10 +7,11 @@ a protected signed annotated tag already on `origin/main`.
 ## Release invariants
 
 The release tool verifies the single public workspace, stable package version,
-exact runtime pins, matching lockfile, package metadata, package-local README
-and LICENSE, prepack build, test exclusion, dist-only allowlist, exports, and a
-production dependency audit. Every direct runtime lock entry must carry an
-exact public-registry URL and SHA-512 integrity. Release commands discard
+exact runtime pins, matching pnpm lockfile, package metadata, package-local
+README and LICENSE, prepack build, test exclusion, dist-only allowlist,
+exports, and a production dependency audit. Every direct runtime lock entry
+must carry SHA-512 integrity and public-registry provenance. Release commands
+discard
 inherited npm configuration, use isolated temporary config files, and pass the
 public registry explicitly. Packing builds once, checks the complete file
 inventory and hashes, and imports the package from a clean consumer
@@ -115,9 +116,11 @@ gh release create v0.1.0 --verify-tag --title "v0.1.0"
 The workflow rejects prerelease events, tag/version mismatches, and every
 normal package version below `0.1.0` immediately after checkout, before
 fetching the protected branch or installing anything. CI and preparation use
-an isolated npm user config plus an explicit public-registry override; the
-release tool repeats that isolation for audit, clean-consumer install,
-registry comparison, and publish.
+Corepack to activate the reviewed `packageManager`, an isolated npm user
+config, and an explicit public-registry override; the release tool repeats
+that isolation for audit, clean-consumer install, registry comparison, and
+publish. Registry publish remains `npm publish` so trusted-publisher OIDC
+keeps its configured allowed action.
 
 The unprivileged preparation job verifies the signed tag, release-event
 commit, main ancestry, full gate, production audit, package inventory,

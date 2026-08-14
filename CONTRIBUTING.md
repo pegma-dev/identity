@@ -5,13 +5,13 @@ Read [AGENTS.md](AGENTS.md) and
 Pull requests must pass the complete gate on Node.js 22 and 24:
 
 ```sh
-npm ci
-npm run format:check
-npm run check
-npm test
-npm audit --omit=dev --audit-level=high
+pnpm install --frozen-lockfile
+pnpm run format:check
+pnpm run check
+pnpm test
+pnpm audit --prod --audit-level=high
 ```
 
-`npm test` starts Azurite. Identity uniqueness, repair, challenge consumption,
+`pnpm test` starts Azurite. Identity uniqueness, repair, challenge consumption,
 and counter transitions must agree between the memory store and the real
 adapter where storage races are involved.

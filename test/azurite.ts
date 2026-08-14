@@ -102,7 +102,9 @@ export async function setup(): Promise<void> {
     "main.js",
   );
   if (!existsSync(entry)) {
-    throw new Error(`Azurite is missing at ${entry}. Run 'npm ci' first.`);
+    throw new Error(
+      `Azurite is missing at ${entry}. Run 'pnpm install --frozen-lockfile' first.`,
+    );
   }
   workspace = await mkdtemp(join(tmpdir(), "pegma-identity-azurite-"));
   child = spawn(

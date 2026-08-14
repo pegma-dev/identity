@@ -16,7 +16,9 @@ import { fileURLToPath } from "node:url";
 const PACKAGE_NAME = "@pegma/identity";
 const PACKAGE_DIRECTORY = "packages/identity";
 const REPOSITORY_URL = "git+https://github.com/pegma-dev/identity.git";
-const PACKAGE_MANAGER = "npm@11.18.0";
+const PACKAGE_MANAGER = "pnpm@10.34.5";
+const PNPM_LOCKFILE_VERSION = "9.0";
+const WORKSPACE_GLOBS = ["packages/*"];
 const NODE_RANGE = ">=22";
 const PUBLIC_REGISTRY = "https://registry.npmjs.org/";
 const REQUIRED_DEPENDENCIES = {
@@ -58,11 +60,14 @@ function run(command, arguments_, options = {}) {
 }
 
 function runNpm(arguments_, options = {}) {
-  const npmExecPath = process.env.npm_execpath;
-  if (npmExecPath !== undefined) {
-    return run(process.execPath, [npmExecPath, ...arguments_], options);
-  }
   return run(process.platform === "win32" ? "npm.cmd" : "npm", arguments_, {
+    ...options,
+    shell: process.platform === "win32",
+  });
+}
+
+function runPnpm(arguments_, options = {}) {
+  return run(process.platform === "win32" ? "pnpm.cmd" : "pnpm", arguments_, {
     ...options,
     shell: process.platform === "win32",
   });
@@ -80,12 +85,131 @@ function sameJson(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function parsePnpmWorkspace(text) {
+  const packages = [];
+  const lines = text.split(/\r?\n/u);
+  if (lines[0] !== "packages:") {
+    fail("pnpm-workspace.yaml is invalid");
+  }
+  for (const line of lines.slice(1)) {
+    if (line === "") {
+      continue;
+    }
+    const match = /^  - ["']([^"']+)["']$/u.exec(line);
+    if (match === null) {
+      fail("pnpm-workspace.yaml is invalid");
+    }
+    packages.push(match[1]);
+  }
+  if (packages.length === 0) {
+    fail("pnpm-workspace.yaml is invalid");
+  }
+  return packages;
+}
+
+function parseResolutionMapping(body) {
+  const fields = {};
+  for (const part of body.split(",")) {
+    const match = /^\s*([A-Za-z][A-Za-z0-9]*)\s*:\s*(.+?)\s*$/u.exec(part);
+    if (match === null) {
+      fail("pnpm-lock.yaml resolution mapping is invalid");
+    }
+    let value = match[2];
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    fields[match[1]] = value;
+  }
+  return fields;
+}
+
+export function parsePnpmLockfile(text) {
+  const version = /^lockfileVersion:\s*['"]([^'"]+)['"]\s*$/mu.exec(text);
+  if (version === null) {
+    fail("pnpm-lock.yaml is missing lockfileVersion");
+  }
+
+  const importerMatch =
+    /^  packages\/identity:\n    dependencies:\n((?:      .+\n)+)/mu.exec(text);
+  if (importerMatch === null) {
+    fail("pnpm-lock.yaml is missing packages/identity dependencies");
+  }
+
+  const specifiers = {};
+  const entryPattern =
+    /^      ('[^']+'|[A-Za-z0-9@/._-]+):\n        specifier: (\S+)\n        version: (\S+)$/gmu;
+  let entry;
+  while ((entry = entryPattern.exec(importerMatch[1])) !== null) {
+    let name = entry[1];
+    if (name.startsWith("'") && name.endsWith("'")) {
+      name = name.slice(1, -1);
+    }
+    specifiers[name] = entry[2];
+  }
+  if (Object.keys(specifiers).length === 0) {
+    fail("pnpm-lock.yaml packages/identity dependencies are empty");
+  }
+
+  const packagesMatch = /^packages:\n\n([\s\S]*?)\n(?=snapshots:\n)/mu.exec(
+    text,
+  );
+  if (packagesMatch === null) {
+    fail("pnpm-lock.yaml is missing the packages catalog");
+  }
+
+  return {
+    lockfileVersion: version[1],
+    identitySpecifiers: specifiers,
+    packagesBlock: packagesMatch[1],
+  };
+}
+
 function directDependencyLockEntry(lock, name, version) {
-  const candidates = [
-    lock.packages?.[`${PACKAGE_DIRECTORY}/node_modules/${name}`],
-    lock.packages?.[`node_modules/${name}`],
-  ];
-  return candidates.find((entry) => entry?.version === version);
+  const key = `${name}@${version}`;
+  const pattern = new RegExp(
+    `^  (?:'${escapeRegExp(key)}'|${escapeRegExp(key)}):\n    resolution: \\{([^}\\n]+)\\}`,
+    "mu",
+  );
+  const match = pattern.exec(lock.packagesBlock);
+  if (match === null) {
+    return undefined;
+  }
+  return parseResolutionMapping(match[1]);
+}
+
+function assertPublicRegistryLockEntry(name, version, dependency) {
+  const fields = dependency === undefined ? [] : Object.keys(dependency);
+  if (
+    dependency === undefined ||
+    typeof dependency.integrity !== "string" ||
+    !dependency.integrity.startsWith("sha512-") ||
+    fields.some((field) => field !== "integrity" && field !== "tarball") ||
+    (dependency.tarball !== undefined &&
+      !dependency.tarball.startsWith(PUBLIC_REGISTRY))
+  ) {
+    fail(
+      `direct runtime dependency ${name}@${version} lacks public-registry provenance`,
+    );
+  }
+}
+
+async function assertAbsentLockfile(root, filename) {
+  try {
+    await stat(join(root, filename));
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+  fail(`${filename} must not be present`);
 }
 
 export function isolatedPublicNpmEnvironment(
@@ -219,8 +343,14 @@ export async function validateRepository(root = defaultRoot()) {
   const manifest = await readJson(
     join(root, PACKAGE_DIRECTORY, "package.json"),
   );
-  const lock = await readJson(join(root, "package-lock.json"));
-  const lockEntry = lock.packages?.[PACKAGE_DIRECTORY];
+  const workspace = parsePnpmWorkspace(
+    await readFile(join(root, "pnpm-workspace.yaml"), "utf8"),
+  );
+  const lock = parsePnpmLockfile(
+    await readFile(join(root, "pnpm-lock.yaml"), "utf8"),
+  );
+  await assertAbsentLockfile(root, "package-lock.json");
+  await assertAbsentLockfile(root, "yarn.lock");
   const packageDirectories = (
     await readdir(join(root, "packages"), { withFileTypes: true })
   )
@@ -232,9 +362,12 @@ export async function validateRepository(root = defaultRoot()) {
     rootManifest.name !== "identity" ||
     rootManifest.private !== true ||
     rootManifest.packageManager !== PACKAGE_MANAGER ||
-    !sameJson(rootManifest.workspaces, ["packages/*"])
+    !sameJson(workspace, WORKSPACE_GLOBS)
   ) {
     fail("the private root workspace metadata is invalid");
+  }
+  if (lock.lockfileVersion !== PNPM_LOCKFILE_VERSION) {
+    fail("pnpm-lock.yaml lockfileVersion is not the reviewed format");
   }
   if (!sameJson(packageDirectories, ["identity"])) {
     fail("the public workspace inventory must contain only packages/identity");
@@ -256,28 +389,19 @@ export async function validateRepository(root = defaultRoot()) {
   }
   if (
     !sameJson(manifest.dependencies, REQUIRED_DEPENDENCIES) ||
-    !sameJson(lockEntry?.dependencies, REQUIRED_DEPENDENCIES)
+    !sameJson(lock.identitySpecifiers, REQUIRED_DEPENDENCIES)
   ) {
     fail("runtime dependencies must match the reviewed exact pins");
   }
   for (const [name, version] of Object.entries(REQUIRED_DEPENDENCIES)) {
-    const dependency = directDependencyLockEntry(lock, name, version);
-    if (
-      dependency === undefined ||
-      typeof dependency.resolved !== "string" ||
-      !dependency.resolved.startsWith("https://registry.npmjs.org/") ||
-      typeof dependency.integrity !== "string" ||
-      !dependency.integrity.startsWith("sha512-")
-    ) {
-      fail(
-        `direct runtime dependency ${name}@${version} lacks public-registry provenance`,
-      );
-    }
+    assertPublicRegistryLockEntry(
+      name,
+      version,
+      directDependencyLockEntry(lock, name, version),
+    );
   }
   if (
-    lockEntry?.name !== PACKAGE_NAME ||
-    lockEntry.version !== manifest.version ||
-    manifest.scripts?.prepack !== "npm run build" ||
+    manifest.scripts?.prepack !== "pnpm run build" ||
     !sameJson(manifest.files, [
       "dist/**/*.d.ts",
       "dist/**/*.d.ts.map",
@@ -300,7 +424,7 @@ export async function validateRepository(root = defaultRoot()) {
       fail(`${PACKAGE_DIRECTORY}/${required} is required`);
     }
   }
-  return { manifest, lockEntry };
+  return { manifest, lock };
 }
 
 function validatePackedFiles(files) {
@@ -376,8 +500,8 @@ async function pack(root, arguments_) {
   }
   const npmConfiguration = await publicNpmConfiguration();
   try {
-    runNpm(
-      publicRegistryArguments(["audit", "--omit=dev", "--audit-level=high"]),
+    runPnpm(
+      publicRegistryArguments(["audit", "--prod", "--audit-level=high"]),
       {
         cwd: root,
         env: npmConfiguration.environment,

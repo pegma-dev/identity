@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   assertNormalReleaseVersion,
   isolatedPublicNpmEnvironment,
+  parsePnpmLockfile,
+  parsePnpmWorkspace,
 } from "./release-package.mjs";
 
 test("normal releases reject every stable version below 0.1.0", () => {
@@ -15,6 +17,47 @@ test("normal releases reject every stable version below 0.1.0", () => {
   }
   assert.doesNotThrow(() => assertNormalReleaseVersion("0.1.0"));
   assert.doesNotThrow(() => assertNormalReleaseVersion("1.0.0"));
+});
+
+test("pnpm workspace and lockfile parsers accept the reviewed format", () => {
+  assert.deepEqual(parsePnpmWorkspace('packages:\n  - "packages/*"\n'), [
+    "packages/*",
+  ]);
+  assert.throws(
+    () => parsePnpmWorkspace("packages:\n  - ../escape\n"),
+    /invalid/u,
+  );
+
+  const lock = parsePnpmLockfile(`lockfileVersion: '9.0'
+
+importers:
+
+  packages/identity:
+    dependencies:
+      '@pegma/mail':
+        specifier: 0.1.1
+        version: 0.1.1
+      punycode:
+        specifier: 2.3.1
+        version: 2.3.1
+
+packages:
+
+  '@pegma/mail@0.1.1':
+    resolution: {integrity: sha512-mailIntegrity==}
+
+  punycode@2.3.1:
+    resolution: {integrity: sha512-punyIntegrity==, tarball: https://registry.npmjs.org/punycode/-/punycode-2.3.1.tgz}
+
+snapshots:
+`);
+
+  assert.equal(lock.lockfileVersion, "9.0");
+  assert.deepEqual(lock.identitySpecifiers, {
+    "@pegma/mail": "0.1.1",
+    punycode: "2.3.1",
+  });
+  assert.match(lock.packagesBlock, /punycode@2\.3\.1/u);
 });
 
 test("release npm commands isolate and override hostile registry config", () => {
