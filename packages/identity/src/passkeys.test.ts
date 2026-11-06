@@ -424,6 +424,97 @@ describe("passkey ceremonies", () => {
     ["memory store", createMemoryStore],
     ["Azurite", createAzuriteStore],
   ] as const)(
+    "returns a durable registration when final challenge cleanup is interrupted over %s",
+    async (_name, makeStore) => {
+      const inner = makeStore();
+      let now = "2026-01-01T00:00:00.000Z";
+      let interruptConsumption = true;
+      const wrapped: Store = {
+        collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
+          const collection = inner.collection(definition);
+          if (definition.name !== challengesCollection.name) {
+            return collection;
+          }
+          return {
+            ...collection,
+            async update(key, decide, updateOptions) {
+              const interruptingDecide: typeof decide = async (current) => {
+                const decision = await decide(current);
+                if (
+                  interruptConsumption &&
+                  decision.action === "write" &&
+                  (decision.value as { state?: unknown }).state === "consumed"
+                ) {
+                  interruptConsumption = false;
+                  throw new Error("simulated challenge cleanup interruption");
+                }
+                return decision;
+              };
+              return updateOptions === undefined
+                ? collection.update(key, interruptingDecide)
+                : collection.update(key, interruptingDecide, updateOptions);
+            },
+          };
+        },
+      };
+      const identity = service(wrapped, { clock: { now: () => now } });
+      const principalId = await provision(identity);
+      const registration = await identity.beginPasskeyRegistration(
+        principalId,
+        "request-registration",
+      );
+
+      await expect(
+        identity.finishPasskeyRegistration({
+          principalId,
+          challengeHandle: registration.challengeHandle,
+          label: "Security key",
+          response: registrationResponse(),
+        }),
+      ).resolves.toMatchObject({
+        credentialId: ceremony.credentialId,
+        label: "Security key",
+      });
+      expect(interruptConsumption).toBe(false);
+
+      const challengeDigest = await challengeHandleHash(
+        registration.challengeHandle,
+      );
+      const challengeKey = {
+        partition: "challenges",
+        id: challengeDigest,
+      };
+      const retained = await inner
+        .collection(challengesCollection)
+        .get(challengeKey);
+      expect(retained).toMatchObject({ state: "verifying" });
+      await expect(
+        identity.finishPasskeyRegistration({
+          principalId,
+          challengeHandle: registration.challengeHandle,
+          label: "Repeated key",
+          response: registrationResponse(),
+        }),
+      ).rejects.toMatchObject({ code: "verification_failed" });
+      await expect(identity.listPasskeys(principalId)).resolves.toHaveLength(1);
+
+      if (retained === null) {
+        throw new Error("expected a retained challenge");
+      }
+      now = new Date(Date.parse(retained.expiresAt) + 1).toISOString();
+      await expect(identity.sweepChallenges(100)).resolves.toMatchObject({
+        deleted: 1,
+      });
+      await expect(
+        inner.collection(challengesCollection).get(challengeKey),
+      ).resolves.toBeNull();
+    },
+  );
+
+  it.each([
+    ["memory store", createMemoryStore],
+    ["Azurite", createAzuriteStore],
+  ] as const)(
     "rejects a substituted credential owner before verification, claims, or mutation over %s",
     async (_name, makeStore) => {
       const inner = makeStore();

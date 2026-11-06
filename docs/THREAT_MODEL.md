@@ -207,8 +207,11 @@ Challenge handles and authenticator responses can be replayed or raced. The
 handle is random and only its domain-separated hash is stored. A verification
 attempt atomically claims a pending record; success consumes it, while failure
 increments a bounded attempt count. Concurrent submissions cannot both claim
-the same challenge. Expired and terminal records are retained until a
-version-conditional sweep, so a stale listing cannot delete replacement
+the same challenge. Once registration has durably activated its credential,
+that durable result remains successful if the final challenge-state write is
+temporarily unavailable: the existing `verifying` claim remains single-flight
+and is collected after expiry. Expired and terminal records are retained until
+a version-conditional sweep, so a stale listing cannot delete replacement
 state.
 
 Storage poisoning can target codecs, sweep key reconstruction, or state

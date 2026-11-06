@@ -1558,7 +1558,6 @@ export function createPasskeyService(
           createdAt: now,
           updatedAt: now,
         });
-        await options.challengeService.consumeClaim(claim);
       } catch (cause) {
         throw cause instanceof IdentityError
           ? cause
@@ -1567,6 +1566,12 @@ export function createPasskeyService(
               "Credential registration could not be persisted.",
               { cause },
             );
+      }
+      try {
+        await options.challengeService.consumeClaim(claim);
+      } catch {
+        // The credential is already durable and the verifying claim remains
+        // single-flight and eligible for collection after expiry.
       }
       return publicPasskey(stored);
     },
