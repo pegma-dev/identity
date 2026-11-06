@@ -88,6 +88,7 @@ export interface PasskeyRecord {
   readonly transports: readonly string[];
   readonly label: string;
   readonly state: PasskeyState;
+  readonly retireAt: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly lastUsedAt: string | null;
@@ -111,6 +112,7 @@ export interface CredentialIndexRecord {
   readonly transports: readonly string[];
   readonly label: string;
   readonly state: CredentialIndexState;
+  readonly retireAt: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -128,7 +130,27 @@ export interface RegistrationProofRecord {
   readonly counter: number;
   readonly transports: readonly string[];
   readonly label: string;
+  readonly expiresAt: string | null;
   readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export type PasskeySlotState = "reserved" | "active" | "revoked";
+
+export interface PasskeySlot {
+  readonly credentialHash: string;
+  readonly registrationId: string;
+  readonly state: PasskeySlotState;
+  readonly expiresAt: string | null;
+  readonly updatedAt: string;
+}
+
+export interface PasskeyPrincipalRecord {
+  readonly partition: string;
+  readonly id: string;
+  readonly principalId: string;
+  readonly principalHash: string;
+  readonly slots: readonly PasskeySlot[];
   readonly updatedAt: string;
 }
 
@@ -149,6 +171,22 @@ function enumValue<const T extends string>(
 
 function timestamp(record: StoredRecord, name: string): string {
   return assertCanonicalTimestamp(readDataProperty(record, name), name);
+}
+
+function optionalTimestamp(record: StoredRecord, name: string): string | null {
+  const descriptor = Object.getOwnPropertyDescriptor(record, name);
+  if (descriptor === undefined) {
+    return null;
+  }
+  if (!("value" in descriptor)) {
+    throw new IdentityError(
+      "storage_corrupt",
+      `Stored property ${name} is missing or unsafe.`,
+    );
+  }
+  return descriptor.value === null
+    ? null
+    : assertCanonicalTimestamp(descriptor.value, name);
 }
 
 function hash(record: StoredRecord, name: string): string {
@@ -386,6 +424,7 @@ function decodePasskey(record: StoredRecord): PasskeyRecord {
     id: hash(record, "id"),
     ...fields,
     state: enumValue(record, "state", ["active", "revoked"]),
+    retireAt: optionalTimestamp(record, "retireAt"),
     lastUsedAt: (() => {
       const value = storedNullableString(record, "lastUsedAt", 32);
       return value === null
@@ -395,7 +434,8 @@ function decodePasskey(record: StoredRecord): PasskeyRecord {
   };
   if (
     decoded.id !== decoded.credentialHash ||
-    decoded.partition !== `passkeys-${decoded.principalHash.slice(0, 32)}`
+    decoded.partition !== `passkeys-${decoded.principalHash.slice(0, 32)}` ||
+    (decoded.state === "active" && decoded.retireAt !== null)
   ) {
     throw new IdentityError(
       "storage_corrupt",
@@ -414,6 +454,7 @@ export const passkeysCollection = defineCollection<PasskeyRecord>({
       id: value.id,
       ...encodePasskeyFields(value),
       state: value.state,
+      retireAt: value.retireAt,
       lastUsedAt: value.lastUsedAt,
     }),
     decode: decodePasskey,
@@ -434,13 +475,15 @@ function decodeCredentialIndex(record: StoredRecord): CredentialIndexRecord {
       "counter-pending",
       "revoked",
     ]),
+    retireAt: optionalTimestamp(record, "retireAt"),
   };
   if (
     decoded.id !== decoded.credentialHash ||
     decoded.partition !== `credential-${decoded.credentialHash.slice(0, 16)}` ||
     (decoded.state === "counter-pending"
       ? decoded.nextCounter <= decoded.counter
-      : decoded.nextCounter !== decoded.counter)
+      : decoded.nextCounter !== decoded.counter) ||
+    (decoded.state !== "revoked" && decoded.retireAt !== null)
   ) {
     throw new IdentityError(
       "storage_corrupt",
@@ -462,6 +505,7 @@ export const credentialIndexesCollection =
         nextCounter: value.nextCounter,
         registrationProofHash: value.registrationProofHash,
         state: value.state,
+        retireAt: value.retireAt,
       }),
       decode: decodeCredentialIndex,
     },
@@ -476,11 +520,14 @@ function decodeRegistrationProof(
     id: hash(record, "id"),
     registrationProofHash: hash(record, "registrationProofHash"),
     ...fields,
+    expiresAt: optionalTimestamp(record, "expiresAt"),
   };
   if (
     decoded.id !== decoded.registrationProofHash ||
     decoded.partition !==
-      `registration-${decoded.registrationProofHash.slice(0, 16)}`
+      `registration-${decoded.registrationProofHash.slice(0, 16)}` ||
+    (decoded.expiresAt !== null &&
+      Date.parse(decoded.expiresAt) <= Date.parse(decoded.updatedAt))
   ) {
     throw new IdentityError(
       "storage_corrupt",
@@ -500,7 +547,126 @@ export const registrationProofsCollection =
         id: value.id,
         registrationProofHash: value.registrationProofHash,
         ...encodePasskeyFields(value),
+        expiresAt: value.expiresAt,
       }),
       decode: decodeRegistrationProof,
+    },
+  });
+
+function decodePasskeySlots(record: StoredRecord): readonly PasskeySlot[] {
+  const serialized = storedString(record, "slots", 64 * 1_024);
+  let value: unknown;
+  try {
+    value = JSON.parse(serialized);
+  } catch (cause) {
+    throw new IdentityError(
+      "storage_corrupt",
+      "Stored passkey slots are malformed.",
+      {
+        cause,
+      },
+    );
+  }
+  if (!Array.isArray(value) || value.length > 128) {
+    throw new IdentityError(
+      "storage_corrupt",
+      "Stored passkey slots are malformed.",
+    );
+  }
+  const seen = new Set<string>();
+  return Object.freeze(
+    value.map((candidate) => {
+      if (
+        typeof candidate !== "object" ||
+        candidate === null ||
+        Array.isArray(candidate) ||
+        Object.getPrototypeOf(candidate) !== Object.prototype
+      ) {
+        throw new IdentityError(
+          "storage_corrupt",
+          "Stored passkey slots are malformed.",
+        );
+      }
+      const credentialHash = assertHash(
+        storedString(candidate as StoredRecord, "credentialHash", 64),
+        "credentialHash",
+      );
+      if (seen.has(credentialHash)) {
+        throw new IdentityError(
+          "storage_corrupt",
+          "Stored passkey slots are malformed.",
+        );
+      }
+      seen.add(credentialHash);
+      const registrationId = storedString(
+        candidate as StoredRecord,
+        "registrationId",
+        256,
+      );
+      const state = enumValue(candidate as StoredRecord, "state", [
+        "reserved",
+        "active",
+        "revoked",
+      ]);
+      const expiresAt = optionalTimestamp(
+        candidate as StoredRecord,
+        "expiresAt",
+      );
+      const updatedAt = timestamp(candidate as StoredRecord, "updatedAt");
+      if (
+        (state === "active") !== (expiresAt === null) ||
+        (expiresAt !== null && Date.parse(expiresAt) <= Date.parse(updatedAt))
+      ) {
+        throw new IdentityError(
+          "storage_corrupt",
+          "Stored passkey slots are malformed.",
+        );
+      }
+      return Object.freeze({
+        credentialHash,
+        registrationId,
+        state,
+        expiresAt,
+        updatedAt,
+      });
+    }),
+  );
+}
+
+function decodePasskeyPrincipal(record: StoredRecord): PasskeyPrincipalRecord {
+  const decoded: PasskeyPrincipalRecord = {
+    partition: storedString(record, "partition", 96),
+    id: hash(record, "id"),
+    principalId: storedString(record, "principalId", 512),
+    principalHash: hash(record, "principalHash"),
+    slots: decodePasskeySlots(record),
+    updatedAt: timestamp(record, "updatedAt"),
+  };
+  if (
+    decoded.id !== decoded.principalHash ||
+    decoded.partition !== `passkeys-${decoded.principalHash.slice(0, 32)}`
+  ) {
+    throw new IdentityError(
+      "storage_corrupt",
+      "Stored passkey principal state is malformed.",
+    );
+  }
+  return decoded;
+}
+
+export const passkeyPrincipalsCollection =
+  defineCollection<PasskeyPrincipalRecord>({
+    name: "pegma_identity_passkey_principals",
+    key: ({ partition, id }) => ({ partition, id }),
+    codec: {
+      encode: (value) => ({
+        partition: value.partition,
+        id: value.id,
+        principalId: value.principalId,
+        principalHash: value.principalHash,
+        slots: JSON.stringify(value.slots),
+        updatedAt: value.updatedAt,
+      }),
+      decode: decodePasskeyPrincipal,
     },
   });

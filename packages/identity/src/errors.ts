@@ -3,6 +3,7 @@ export type IdentityErrorCode =
   | "conflict"
   | "not_found"
   | "invalid_state"
+  | "limit_exceeded"
   | "rate_limited"
   | "verification_failed"
   | "storage_corrupt";

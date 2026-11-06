@@ -22,7 +22,7 @@ The protected assets are:
 
 Mailbox control is the account-recovery security floor. The component cannot
 make a compromised mailbox safe; hosts must communicate that limit and should
-encourage passkey enrollment. `@pegma/mail@0.1.0` provides durable
+encourage passkey enrollment. `@pegma/mail@0.1.1` provides durable
 at-least-once delivery state while the provider remains host-owned.
 
 ## Threat Model, Trust Boundaries, and Assumptions
@@ -81,11 +81,24 @@ Security invariants:
   scoped to configured RP IDs and origins, and support multiple credentials
   per principal. Every credential-index trust boundary recomputes
   `principalHash` from `principalId` before verification, mutation, repair, or
-  claims issuance. A reserved generation can create its passkey mirror only
-  from an exact, content-addressed immutable registration proof stored before
-  the reservation; an active generation must cross-check the independently
-  stored passkey mirror's owner, credential identity, generation, public key,
-  transports, label, creation time, and counter.
+  claims issuance. A per-principal storage record reserves capacity before an
+  immutable registration proof is stored, and the credential index can enter
+  `reserved` only with that exact content-addressed proof. An active generation
+  must cross-check the independently stored passkey mirror's owner, credential
+  identity, generation, public key, transports, label, creation time, and
+  counter.
+- Per-principal passkey capacity is serialized through that storage record.
+  Active and in-flight credentials count toward a configurable limit (10 by
+  default), while active and revoked credential records count toward a second
+  configurable limit (20 by default). Both bounds are re-evaluated inside the
+  optimistic update that reserves capacity, so concurrent registrations cannot
+  exceed them.
+- Registration proofs carry a configurable collection deadline (24 hours by
+  default). Maintenance retains a proof while its exact reserved generation
+  still needs repair; after the deadline it may collect proofs for completed
+  generations or registrations that did not obtain a credential reservation.
+  Reserved capacity is released only after neither credential record references
+  that generation.
 - Authenticator attestation is deliberately not verified. Registration uses
   `attestationType: "none"`, so no authenticator-model or AAGUID policy is
   expressed and software passkeys are accepted. This is the correct default
@@ -106,6 +119,15 @@ Security invariants:
   which repair finalizes the index. A crash on either side of the mirror write
   is replayable without weakening owner, generation, or counter-regression
   checks.
+- Passkey removal returns success only after the exact credential generation is
+  `revoked` in both the credential index and principal mirror. If an assertion
+  has placed the index in `counter-pending`, removal completes that repair and
+  retries the revocation in a bounded loop; retry exhaustion is a conflict, not
+  a successful result.
+- Revoked credential-index and mirror records share a configurable retention
+  fence (30 days by default). Maintenance uses version-conditional deletion and
+  removes the per-principal retained slot only after the generation is no
+  longer present. Active and in-flight generations are not compacted.
 - Raw token-shaped values, one-time codes, and challenge verification
   material never enter storage, logs, or error messages.
 - Eight-digit codes are deterministically derived with unbiased rejection
@@ -161,7 +183,8 @@ Cross-collection crashes are expected, so intermediate states are durable and
 repairable rather than treated as exceptional.
 
 WebAuthn option generation can be abused for storage exhaustion. Challenge
-TTLs, maximum attempts, bounded identifiers and labels, authoritative
+TTLs, maximum attempts, bounded identifiers and labels, per-principal active
+and retained-credential limits, proof and tombstone retention, authoritative
 adapter-bounded scan pages, and host endpoint rate limiting constrain the
 budget. Sweep decodes each physical row independently, so a malformed row is
 retained for investigation without preventing the continuation from reaching

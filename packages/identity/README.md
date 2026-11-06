@@ -71,6 +71,11 @@ const identity = createIdentity({
   emailCodeProtector: createHmacEmailCodeProtector(emailCodeSecret),
   emailCodeRequestLimiter,
   emailCodeVerificationLimiter,
+  // Defaults shown explicitly; choose lower host-specific bounds if needed.
+  passkeyMaxActiveCredentials: 10,
+  passkeyMaxRetainedCredentials: 20,
+  passkeyRegistrationProofRetentionMs: 24 * 60 * 60_000,
+  passkeyTombstoneRetentionMs: 30 * 24 * 60 * 60_000,
 });
 ```
 
@@ -155,8 +160,9 @@ await worker.runReconciliationPage({ limit: 100 });
 
 Authenticate and deduplicate provider callbacks before passing them to
 `applyAuthenticatedMailCallback`. Schedule `sweepEmailOperations`,
-`sweepMail`, both Mail worker cursor cycles, `sweepChallenges`, and the two
-durable limiter sweeps independently. Persist every non-null opaque cursor.
+`sweepMail`, both Mail worker cursor cycles, `sweepChallenges`,
+`sweepPasskeys`, and the two durable limiter sweeps independently. Persist
+every non-null opaque cursor.
 Dead-letter and terminal-unknown mail stays operator-visible until explicitly
 acknowledged. Provider, renderer, and reconciliation calls must enforce finite
 timeouts shorter than the Mail lease.
@@ -232,6 +238,21 @@ const claims = await identity.finishPasskeyAuthentication({
 The host must authenticate passkey list/add/remove endpoints for the named
 principal. Removing the last passkey is allowed because the durable
 email-code recovery floor is available.
+
+Active and in-flight registrations share the configured per-principal active
+credential limit. Active and revoked records share the retained-credential
+limit. Enrollment returns `IdentityError` with code `limit_exceeded` when the
+relevant limit has been reached. Limits and retention settings must be
+positive integers within their documented type-level option bounds; the
+retained limit must be at least the active limit.
+
+Run `sweepPasskeys(limit, cursor)` periodically using the same cursor loop
+shown below for challenges. It collects completed or unreferenced registration
+proofs after their grace period, removes revoked credential records after
+their retention fence, and releases expired registration reservations only
+when no credential record still references their generation. Passkey removal
+returns `true` only after the credential index and principal mirror both store
+the revoked generation.
 
 Run `sweepChallenges(limit, cursor)` periodically. Each call scans and
 inspects at most `limit` physical challenge rows, retains malformed rows for

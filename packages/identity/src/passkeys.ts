@@ -23,11 +23,14 @@ import {
 import { IdentityError } from "./errors.js";
 import {
   credentialIndexesCollection,
+  passkeyPrincipalsCollection,
   passkeysCollection,
   registrationProofsCollection,
   TRANSPORTS,
   type CredentialIndexRecord,
+  type PasskeyPrincipalRecord,
   type PasskeyRecord,
+  type PasskeySlot,
   type RegistrationProofRecord,
 } from "./records.js";
 import type { User, UserService, VerifiedIdentityClaims } from "./users.js";
@@ -53,6 +56,10 @@ interface PasskeyServiceOptions {
   readonly challengeService: ChallengeService;
   readonly users: UserService;
   readonly newId: () => string;
+  readonly maxActiveCredentials: number;
+  readonly maxRetainedCredentials: number;
+  readonly registrationProofRetentionMs: number;
+  readonly tombstoneRetentionMs: number;
 }
 
 export interface RegistrationStart {
@@ -101,6 +108,16 @@ export interface PasskeyService {
     credentialId: string,
   ): Promise<boolean>;
   repairPasskey(credentialId: string): Promise<Passkey | null>;
+  sweep(limit?: number, cursor?: string): Promise<PasskeySweepResult>;
+}
+
+export interface PasskeySweepResult {
+  readonly inspected: number;
+  readonly deletedProofs: number;
+  readonly deletedTombstones: number;
+  readonly releasedReservations: number;
+  readonly cursor: string | null;
+  readonly hasMore: boolean;
 }
 
 function passkeyPartition(hash: string): string {
@@ -111,6 +128,13 @@ function passkeyKey(principalDigest: string, credentialDigest: string) {
   return {
     partition: passkeyPartition(principalDigest),
     id: credentialDigest,
+  };
+}
+
+function passkeyPrincipalKey(principalDigest: string) {
+  return {
+    partition: passkeyPartition(principalDigest),
+    id: principalDigest,
   };
 }
 
@@ -211,8 +235,17 @@ function finalizedCounterTransition(
 
 type RegistrationMaterial = Omit<
   CredentialIndexRecord,
-  "partition" | "id" | "registrationProofHash" | "state" | "nextCounter"
+  | "partition"
+  | "id"
+  | "registrationProofHash"
+  | "state"
+  | "nextCounter"
+  | "retireAt"
 >;
+
+function after(milliseconds: number, durationMs: number): string {
+  return new Date(milliseconds + durationMs).toISOString();
+}
 
 function registrationProofMaterial(material: RegistrationMaterial): string {
   return JSON.stringify([
@@ -340,6 +373,345 @@ export function createPasskeyService(
   const registrationProofs = options.store.collection(
     registrationProofsCollection,
   );
+  const principals = options.store.collection(passkeyPrincipalsCollection);
+
+  async function assertPrincipalStateOwner(
+    state: PasskeyPrincipalRecord,
+  ): Promise<void> {
+    if ((await principalHash(state.principalId)) !== state.principalHash) {
+      throw new IdentityError(
+        "storage_corrupt",
+        "Stored passkey principal state is malformed.",
+      );
+    }
+  }
+
+  function slotFromPasskey(passkey: PasskeyRecord): PasskeySlot {
+    return {
+      credentialHash: passkey.credentialHash,
+      registrationId: passkey.registrationId,
+      state: passkey.state,
+      expiresAt:
+        passkey.state === "revoked"
+          ? (passkey.retireAt ??
+            after(Date.parse(passkey.updatedAt), options.tombstoneRetentionMs))
+          : null,
+      updatedAt: passkey.updatedAt,
+    };
+  }
+
+  function sameSlots(
+    left: readonly PasskeySlot[],
+    right: readonly PasskeySlot[],
+  ): boolean {
+    return (
+      left.length === right.length &&
+      left.every((slot, position) => {
+        const candidate = right[position];
+        return (
+          candidate !== undefined &&
+          slot.credentialHash === candidate.credentialHash &&
+          slot.registrationId === candidate.registrationId &&
+          slot.state === candidate.state &&
+          slot.expiresAt === candidate.expiresAt &&
+          slot.updatedAt === candidate.updatedAt
+        );
+      })
+    );
+  }
+
+  async function mergedPrincipalSlots(
+    principalId: string,
+    principalDigest: string,
+    existing: readonly PasskeySlot[],
+  ): Promise<readonly PasskeySlot[]> {
+    const slots = [...existing];
+    const mirrors = await passkeys.list(passkeyPartition(principalDigest));
+    for (const mirror of mirrors) {
+      if (
+        mirror.principalId !== principalId ||
+        mirror.principalHash !== principalDigest
+      ) {
+        throw new IdentityError(
+          "storage_corrupt",
+          "Stored credential binding is malformed.",
+        );
+      }
+      const next = slotFromPasskey(mirror);
+      const position = slots.findIndex(
+        (slot) => slot.credentialHash === mirror.credentialHash,
+      );
+      if (position < 0) {
+        slots.push(next);
+        continue;
+      }
+      const current = slots[position];
+      if (current?.registrationId === mirror.registrationId) {
+        slots[position] = next;
+        continue;
+      }
+      if (current?.state === "active") {
+        throw new IdentityError(
+          "storage_corrupt",
+          "Stored passkey principal state is malformed.",
+        );
+      }
+      if (current?.state !== "reserved") {
+        slots[position] = next;
+      }
+    }
+    return Object.freeze(
+      slots.sort((left, right) =>
+        left.credentialHash.localeCompare(right.credentialHash),
+      ),
+    );
+  }
+
+  async function ensurePrincipalState(
+    principalId: string,
+    principalDigest: string,
+    updatedAt: string,
+  ): Promise<PasskeyPrincipalRecord> {
+    const key = passkeyPrincipalKey(principalDigest);
+    const result = await principals.update(
+      key,
+      async (current) => {
+        if (current !== null) {
+          await assertPrincipalStateOwner(current);
+          if (
+            current.principalId !== principalId ||
+            current.principalHash !== principalDigest
+          ) {
+            return { action: "keep" };
+          }
+        }
+        const slots = await mergedPrincipalSlots(
+          principalId,
+          principalDigest,
+          current?.slots ?? [],
+        );
+        if (current !== null && sameSlots(current.slots, slots)) {
+          return { action: "keep" };
+        }
+        return {
+          action: "write",
+          value: {
+            ...key,
+            principalId,
+            principalHash: principalDigest,
+            slots,
+            updatedAt,
+          },
+        };
+      },
+      { maxAttempts: 10 },
+    );
+    if (
+      result.value === null ||
+      result.value.principalId !== principalId ||
+      result.value.principalHash !== principalDigest
+    ) {
+      throw new IdentityError(
+        "storage_corrupt",
+        "Stored passkey principal state is malformed.",
+      );
+    }
+    return result.value;
+  }
+
+  async function reservePrincipalSlot(
+    material: RegistrationMaterial,
+    expiresAt: string,
+  ): Promise<void> {
+    const key = passkeyPrincipalKey(material.principalHash);
+    const result = await principals.update(
+      key,
+      async (current) => {
+        if (current !== null) {
+          await assertPrincipalStateOwner(current);
+          if (
+            current.principalId !== material.principalId ||
+            current.principalHash !== material.principalHash
+          ) {
+            return { action: "keep" };
+          }
+        }
+        const slots = [
+          ...(await mergedPrincipalSlots(
+            material.principalId,
+            material.principalHash,
+            current?.slots ?? [],
+          )),
+        ];
+        const position = slots.findIndex(
+          (slot) => slot.credentialHash === material.credentialHash,
+        );
+        const candidate = position < 0 ? undefined : slots[position];
+        const active = slots.filter((slot) => slot.state !== "revoked").length;
+        const mayReserve =
+          (candidate === undefined || candidate.state === "revoked") &&
+          active < options.maxActiveCredentials &&
+          (candidate !== undefined ||
+            slots.length < options.maxRetainedCredentials);
+        if (mayReserve) {
+          const reserved: PasskeySlot = {
+            credentialHash: material.credentialHash,
+            registrationId: material.registrationId,
+            state: "reserved",
+            expiresAt,
+            updatedAt: material.updatedAt,
+          };
+          if (position < 0) {
+            slots.push(reserved);
+          } else {
+            slots[position] = reserved;
+          }
+        }
+        const normalized = Object.freeze(
+          slots.sort((left, right) =>
+            left.credentialHash.localeCompare(right.credentialHash),
+          ),
+        );
+        if (
+          current !== null &&
+          sameSlots(current.slots, normalized) &&
+          !mayReserve
+        ) {
+          return { action: "keep" };
+        }
+        return {
+          action: "write",
+          value: {
+            ...key,
+            principalId: material.principalId,
+            principalHash: material.principalHash,
+            slots: normalized,
+            updatedAt: material.updatedAt,
+          },
+        };
+      },
+      { maxAttempts: 10 },
+    );
+    const slot = result.value?.slots.find(
+      (candidate) =>
+        candidate.credentialHash === material.credentialHash &&
+        candidate.registrationId === material.registrationId &&
+        candidate.state === "reserved",
+    );
+    if (slot !== undefined) {
+      return;
+    }
+    const state = result.value;
+    if (
+      state !== null &&
+      (state.slots.filter((candidate) => candidate.state !== "revoked")
+        .length >= options.maxActiveCredentials ||
+        state.slots.length >= options.maxRetainedCredentials)
+    ) {
+      throw new IdentityError("limit_exceeded", "Passkey limit reached.");
+    }
+    throw new IdentityError(
+      "conflict",
+      "Another credential registration won the race.",
+    );
+  }
+
+  async function setPrincipalSlot(
+    index: CredentialIndexRecord,
+    state: "active" | "revoked",
+    expiresAt: string | null,
+  ): Promise<void> {
+    const key = passkeyPrincipalKey(index.principalHash);
+    const result = await principals.update(
+      key,
+      async (current) => {
+        if (current !== null) {
+          await assertPrincipalStateOwner(current);
+        }
+        if (
+          current === null ||
+          current.principalId !== index.principalId ||
+          current.principalHash !== index.principalHash
+        ) {
+          return { action: "keep" };
+        }
+        const position = current.slots.findIndex(
+          (slot) =>
+            slot.credentialHash === index.credentialHash &&
+            slot.registrationId === index.registrationId,
+        );
+        if (position < 0) {
+          return { action: "keep" };
+        }
+        const slots = [...current.slots];
+        slots[position] = {
+          ...slots[position]!,
+          state,
+          expiresAt,
+          updatedAt: index.updatedAt,
+        };
+        return {
+          action: "write",
+          value: { ...current, slots, updatedAt: index.updatedAt },
+        };
+      },
+      { maxAttempts: 10 },
+    );
+    const slot = result.value?.slots.find(
+      (candidate) =>
+        candidate.credentialHash === index.credentialHash &&
+        candidate.registrationId === index.registrationId,
+    );
+    if (slot?.state !== state || slot.expiresAt !== expiresAt) {
+      throw new IdentityError(
+        "storage_corrupt",
+        "Stored passkey principal state is malformed.",
+      );
+    }
+  }
+
+  async function releasePrincipalSlot(
+    principalId: string,
+    principalDigest: string,
+    credentialDigest: string,
+    registrationId: string,
+    updatedAt: string,
+  ): Promise<boolean> {
+    const result = await principals.update(
+      passkeyPrincipalKey(principalDigest),
+      async (current) => {
+        if (current !== null) {
+          await assertPrincipalStateOwner(current);
+        }
+        if (
+          current === null ||
+          current.principalId !== principalId ||
+          current.principalHash !== principalDigest ||
+          !current.slots.some(
+            (slot) =>
+              slot.credentialHash === credentialDigest &&
+              slot.registrationId === registrationId,
+          )
+        ) {
+          return { action: "keep" };
+        }
+        return {
+          action: "write",
+          value: {
+            ...current,
+            slots: current.slots.filter(
+              (slot) =>
+                slot.credentialHash !== credentialDigest ||
+                slot.registrationId !== registrationId,
+            ),
+            updatedAt,
+          },
+        };
+      },
+      { maxAttempts: 10 },
+    );
+    return result.written;
+  }
 
   async function assertRegistrationProof(
     index: CredentialIndexRecord,
@@ -366,6 +738,7 @@ export function createPasskeyService(
 
   async function persistRegistrationProof(
     material: RegistrationMaterial,
+    expiresAt: string,
   ): Promise<string> {
     const proofHash = await registrationProofHash(
       registrationProofMaterial(material),
@@ -374,6 +747,7 @@ export function createPasskeyService(
       ...registrationProofKey(proofHash),
       ...material,
       registrationProofHash: proofHash,
+      expiresAt,
     };
     const inserted = await registrationProofs.insertIfAbsent(proposed);
     if (
@@ -384,6 +758,7 @@ export function createPasskeyService(
         nextCounter: material.counter,
         registrationProofHash: proofHash,
         state: "reserved",
+        retireAt: null,
       })
     ) {
       throw new IdentityError(
@@ -457,6 +832,7 @@ export function createPasskeyService(
           transports: index.transports,
           label: index.label,
           state: "active",
+          retireAt: null,
           createdAt:
             current?.registrationId === index.registrationId
               ? current.createdAt
@@ -526,31 +902,44 @@ export function createPasskeyService(
   ): Promise<PasskeyRecord | null> {
     await assertCredentialOwner(index);
     if (index.state === "revoked") {
-      const existing = await passkeys.get(
+      const mirrored = await passkeys.update(
         passkeyKey(index.principalHash, index.credentialHash),
-      );
-      if (existing !== null && existing.state !== "revoked") {
-        await passkeys.update(
-          passkeyKey(index.principalHash, index.credentialHash),
-          (current) =>
-            current === null ||
-            current.principalId !== index.principalId ||
-            current.principalHash !== index.principalHash ||
-            current.credentialId !== index.credentialId ||
-            current.registrationId !== index.registrationId ||
-            current.state === "revoked"
-              ? { action: "keep" }
-              : {
-                  action: "write",
-                  value: {
-                    ...current,
-                    state: "revoked",
-                    updatedAt: index.updatedAt,
-                  },
+        (current) =>
+          current === null ||
+          current.principalId !== index.principalId ||
+          current.principalHash !== index.principalHash ||
+          current.credentialId !== index.credentialId ||
+          current.registrationId !== index.registrationId ||
+          current.state === "revoked"
+            ? { action: "keep" }
+            : {
+                action: "write",
+                value: {
+                  ...current,
+                  state: "revoked",
+                  retireAt: index.retireAt,
+                  updatedAt: index.updatedAt,
                 },
-          { maxAttempts: 10 },
+              },
+        { maxAttempts: 10 },
+      );
+      if (
+        mirrored.value !== null &&
+        (mirrored.value.state !== "revoked" ||
+          !sameCredentialBinding(mirrored.value, index) ||
+          mirrored.value.retireAt !== index.retireAt)
+      ) {
+        throw new IdentityError(
+          "conflict",
+          "Credential changed while it was being repaired.",
         );
       }
+      await ensurePrincipalState(
+        index.principalId,
+        index.principalHash,
+        index.updatedAt,
+      );
+      await setPrincipalSlot(index, "revoked", index.retireAt);
       return null;
     }
     if (index.state === "counter-pending") {
@@ -642,6 +1031,12 @@ export function createPasskeyService(
         );
       }
       await assertCredentialMirror(finalized.value);
+      await ensurePrincipalState(
+        finalized.value.principalId,
+        finalized.value.principalHash,
+        finalized.value.updatedAt,
+      );
+      await setPrincipalSlot(finalized.value, "active", null);
       return mirrored.value;
     }
     const current = await credentials.get(credentialKey(index.credentialHash));
@@ -661,7 +1056,13 @@ export function createPasskeyService(
       await assertCredentialMirror(index);
     }
     const passkey = await ensurePasskey(index);
-    await activateCredential(index);
+    const active = await activateCredential(index);
+    await ensurePrincipalState(
+      active.principalId,
+      active.principalHash,
+      active.updatedAt,
+    );
+    await setPrincipalSlot(active, "active", null);
     return passkey;
   }
 
@@ -680,13 +1081,19 @@ export function createPasskeyService(
         "Credential is already bound to another registration.",
       );
     }
-    const proofHash = await persistRegistrationProof(material);
+    const proofExpiresAt = after(
+      Date.parse(material.updatedAt),
+      options.registrationProofRetentionMs,
+    );
+    await reservePrincipalSlot(material, proofExpiresAt);
+    const proofHash = await persistRegistrationProof(material, proofExpiresAt);
     const proposed: CredentialIndexRecord = {
       ...key,
       ...material,
       nextCounter: material.counter,
       registrationProofHash: proofHash,
       state: "reserved",
+      retireAt: null,
     };
     let index = (await credentials.insertIfAbsent(proposed)).value;
     await assertCredentialOwner(index);
@@ -771,6 +1178,17 @@ export function createPasskeyService(
         options.registrationLimiter,
         `webauthn-registration:${principalDigest}:${rateLimitKey}`,
       );
+      const state = await ensurePrincipalState(
+        principalId,
+        principalDigest,
+        timestampFromClock(options.clock).value,
+      );
+      if (
+        state.slots.filter((slot) => slot.state !== "revoked").length >=
+        options.maxActiveCredentials
+      ) {
+        throw new IdentityError("limit_exceeded", "Passkey limit reached.");
+      }
       const existing = (
         await passkeys.list(passkeyPartition(principalDigest))
       ).filter((passkey) => passkey.state === "active");
@@ -1091,45 +1509,144 @@ export function createPasskeyService(
       );
       const digest = await credentialHash(credentialId);
       const principalDigest = await principalHash(principalId);
-      const interrupted = await credentials.get(credentialKey(digest));
-      if (
-        interrupted?.state === "counter-pending" &&
-        interrupted.credentialId === credentialId &&
-        interrupted.principalId === principalId &&
-        interrupted.principalHash === principalDigest
-      ) {
-        await repair(interrupted);
-      }
-      const now = timestampFromClock(options.clock).value;
-      let revoked = false;
-      const result = await credentials.update(
-        credentialKey(digest),
-        async (current) => {
-          if (current?.state === "active") {
-            await assertCredentialMirror(current);
-          }
+      const startedAt = timestampFromClock(options.clock);
+      await ensurePrincipalState(principalId, principalDigest, startedAt.value);
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        const observed = await credentials.get(credentialKey(digest));
+        if (
+          observed === null ||
+          observed.principalId !== principalId ||
+          observed.principalHash !== principalDigest ||
+          observed.credentialId !== credentialId ||
+          observed.state === "reserved"
+        ) {
+          return false;
+        }
+        if (observed.state === "revoked") {
+          await repair(observed);
+          const mirror = await passkeys.get(
+            passkeyKey(principalDigest, digest),
+          );
           if (
-            current === null ||
-            current.principalId !== principalId ||
-            current.principalHash !== principalDigest ||
-            current.credentialId !== credentialId ||
-            current.state !== "active"
+            mirror?.state !== "revoked" ||
+            !sameCredentialBinding(mirror, observed) ||
+            mirror.retireAt !== observed.retireAt
           ) {
-            return { action: "keep" };
+            throw new IdentityError(
+              "conflict",
+              "Passkey removal did not converge.",
+            );
           }
-          revoked = true;
-          return {
-            action: "write",
-            value: { ...current, state: "revoked", updatedAt: now },
-          };
-        },
-        { maxAttempts: 10 },
-      );
-      if (!revoked || result.value === null) {
-        return false;
+          return false;
+        }
+        if (observed.state === "counter-pending") {
+          try {
+            await repair(observed);
+          } catch (cause) {
+            if (
+              !(cause instanceof IdentityError) ||
+              cause.code !== "conflict"
+            ) {
+              throw cause;
+            }
+          }
+          continue;
+        }
+        const retireAt = after(
+          startedAt.milliseconds,
+          options.tombstoneRetentionMs,
+        );
+        const result = await credentials.update(
+          credentialKey(digest),
+          async (current) => {
+            if (current?.state === "active") {
+              await assertCredentialMirror(current);
+            }
+            if (
+              current === null ||
+              current.principalId !== principalId ||
+              current.principalHash !== principalDigest ||
+              current.credentialId !== credentialId ||
+              current.registrationId !== observed.registrationId ||
+              current.state !== "active"
+            ) {
+              return { action: "keep" };
+            }
+            return {
+              action: "write",
+              value: {
+                ...current,
+                state: "revoked",
+                retireAt,
+                updatedAt: startedAt.value,
+              },
+            };
+          },
+          { maxAttempts: 10 },
+        );
+        if (
+          result.written &&
+          result.value?.state === "revoked" &&
+          result.value.principalId === principalId &&
+          result.value.principalHash === principalDigest &&
+          result.value.credentialId === credentialId &&
+          result.value.registrationId === observed.registrationId
+        ) {
+          await repair(result.value);
+          const [confirmed, mirror] = await Promise.all([
+            credentials.get(credentialKey(digest)),
+            passkeys.get(passkeyKey(principalDigest, digest)),
+          ]);
+          if (
+            confirmed?.state === "revoked" &&
+            confirmed.principalId === principalId &&
+            confirmed.principalHash === principalDigest &&
+            confirmed.credentialId === credentialId &&
+            confirmed.registrationId === observed.registrationId &&
+            mirror?.state === "revoked" &&
+            mirror.principalId === principalId &&
+            mirror.principalHash === principalDigest &&
+            mirror.credentialId === credentialId &&
+            mirror.registrationId === observed.registrationId &&
+            sameCredentialBinding(mirror, confirmed) &&
+            mirror.retireAt === confirmed.retireAt
+          ) {
+            return true;
+          }
+          throw new IdentityError(
+            "conflict",
+            "Passkey removal did not converge.",
+          );
+        }
+        if (
+          result.value?.state === "counter-pending" &&
+          result.value.principalId === principalId &&
+          result.value.principalHash === principalDigest &&
+          result.value.credentialId === credentialId
+        ) {
+          try {
+            await repair(result.value);
+          } catch (cause) {
+            if (
+              !(cause instanceof IdentityError) ||
+              cause.code !== "conflict"
+            ) {
+              throw cause;
+            }
+          }
+          continue;
+        }
+        if (
+          result.value === null ||
+          result.value.principalId !== principalId ||
+          result.value.principalHash !== principalDigest ||
+          result.value.credentialId !== credentialId ||
+          result.value.state === "revoked"
+        ) {
+          return false;
+        }
       }
-      await repair(result.value);
-      return true;
+      throw new IdentityError("conflict", "Passkey removal did not converge.");
     },
 
     async repairPasskey(credentialInput) {
@@ -1146,6 +1663,280 @@ export function createPasskeyService(
       }
       const repaired = await repair(index);
       return repaired === null ? null : publicPasskey(repaired);
+    },
+
+    async sweep(limitInput = 100, cursorInput) {
+      if (
+        !Number.isSafeInteger(limitInput) ||
+        limitInput < 1 ||
+        limitInput > 1_000
+      ) {
+        throw new IdentityError("invalid_input", "Sweep limit is invalid.");
+      }
+      const stages = ["proofs", "indexes", "mirrors", "principals"] as const;
+      type Stage = (typeof stages)[number];
+      let stage: Stage = "proofs";
+      let adapterCursor: string | undefined;
+      if (cursorInput !== undefined) {
+        const cursor = assertBoundedString(cursorInput, "Sweep cursor", 16_384);
+        const separator = cursor.indexOf(":");
+        const candidate = cursor.slice(0, separator) as Stage;
+        if (separator < 0 || !stages.includes(candidate)) {
+          throw new IdentityError("invalid_input", "Sweep cursor is invalid.");
+        }
+        stage = candidate;
+        const nested = cursor.slice(separator + 1);
+        adapterCursor = nested === "" ? undefined : nested;
+      }
+      const now = timestampFromClock(options.clock);
+      let inspected = 0;
+      let deletedProofs = 0;
+      let deletedTombstones = 0;
+      let releasedReservations = 0;
+      let nextAdapterCursor: string | null;
+
+      if (stage === "proofs") {
+        const page = await registrationProofs.scan({
+          limit: limitInput,
+          ...(adapterCursor === undefined ? {} : { cursor: adapterCursor }),
+        });
+        inspected = page.records.length;
+        nextAdapterCursor = page.nextCursor;
+        for (const row of page.records) {
+          const proof = row.value;
+          const expiresAt =
+            proof.expiresAt ??
+            after(
+              Date.parse(proof.updatedAt),
+              options.registrationProofRetentionMs,
+            );
+          if (Date.parse(expiresAt) > now.milliseconds) {
+            continue;
+          }
+          let index = await credentials.get(
+            credentialKey(proof.credentialHash),
+          );
+          if (
+            index !== null &&
+            index.state === "reserved" &&
+            sameRegistrationProof(proof, index)
+          ) {
+            try {
+              await repair(index);
+            } catch {
+              continue;
+            }
+            index = await credentials.get(credentialKey(proof.credentialHash));
+          }
+          if (
+            index !== null &&
+            sameRegistrationProof(proof, index) &&
+            index.state === "reserved"
+          ) {
+            continue;
+          }
+          if (
+            index !== null &&
+            sameRegistrationProof(proof, index) &&
+            (index.state === "active" || index.state === "counter-pending")
+          ) {
+            try {
+              if (index.state === "counter-pending") {
+                await repair(index);
+              } else {
+                await assertCredentialMirror(index);
+              }
+            } catch {
+              continue;
+            }
+          }
+          if (
+            await registrationProofs.deleteIfUnchanged(row.key, row.version)
+          ) {
+            deletedProofs += 1;
+          }
+        }
+      } else if (stage === "indexes") {
+        const page = await credentials.scan({
+          limit: limitInput,
+          ...(adapterCursor === undefined ? {} : { cursor: adapterCursor }),
+        });
+        inspected = page.records.length;
+        nextAdapterCursor = page.nextCursor;
+        for (const row of page.records) {
+          const index = row.value;
+          if (index.state !== "revoked") {
+            continue;
+          }
+          const retireAt =
+            index.retireAt ??
+            after(Date.parse(index.updatedAt), options.tombstoneRetentionMs);
+          if (Date.parse(retireAt) > now.milliseconds) {
+            continue;
+          }
+          const mirrorKey = passkeyKey(
+            index.principalHash,
+            index.credentialHash,
+          );
+          const mirror = await passkeys.getVersioned(mirrorKey);
+          if (mirror !== null) {
+            const mirrorRetireAt =
+              mirror.value.retireAt ??
+              after(
+                Date.parse(mirror.value.updatedAt),
+                options.tombstoneRetentionMs,
+              );
+            if (
+              mirror.value.state !== "revoked" ||
+              !sameCredentialBinding(mirror.value, index) ||
+              Date.parse(mirrorRetireAt) > now.milliseconds ||
+              (mirror.value.retireAt !== null &&
+                index.retireAt !== null &&
+                mirror.value.retireAt !== index.retireAt)
+            ) {
+              continue;
+            }
+            if (
+              !(await passkeys.deleteIfUnchanged(mirrorKey, mirror.version))
+            ) {
+              continue;
+            }
+          }
+          if (await credentials.deleteIfUnchanged(row.key, row.version)) {
+            deletedTombstones += 1;
+            await releasePrincipalSlot(
+              index.principalId,
+              index.principalHash,
+              index.credentialHash,
+              index.registrationId,
+              now.value,
+            );
+          }
+        }
+      } else if (stage === "mirrors") {
+        const page = await passkeys.scan({
+          limit: limitInput,
+          ...(adapterCursor === undefined ? {} : { cursor: adapterCursor }),
+        });
+        inspected = page.records.length;
+        nextAdapterCursor = page.nextCursor;
+        for (const row of page.records) {
+          const mirror = row.value;
+          if (mirror.state !== "revoked") {
+            continue;
+          }
+          const retireAt =
+            mirror.retireAt ??
+            after(Date.parse(mirror.updatedAt), options.tombstoneRetentionMs);
+          if (Date.parse(retireAt) > now.milliseconds) {
+            continue;
+          }
+          const index = await credentials.get(
+            credentialKey(mirror.credentialHash),
+          );
+          if (
+            index !== null &&
+            index.state === "revoked" &&
+            sameCredentialBinding(mirror, index)
+          ) {
+            continue;
+          }
+          if (await passkeys.deleteIfUnchanged(row.key, row.version)) {
+            await releasePrincipalSlot(
+              mirror.principalId,
+              mirror.principalHash,
+              mirror.credentialHash,
+              mirror.registrationId,
+              now.value,
+            );
+          }
+        }
+      } else {
+        const page = await principals.scan({
+          limit: limitInput,
+          ...(adapterCursor === undefined ? {} : { cursor: adapterCursor }),
+        });
+        inspected = page.records.length;
+        nextAdapterCursor = page.nextCursor;
+        for (const row of page.records) {
+          const current = row.value;
+          await assertPrincipalStateOwner(current);
+          const retained: PasskeySlot[] = [];
+          for (const slot of current.slots) {
+            if (
+              slot.expiresAt === null ||
+              Date.parse(slot.expiresAt) > now.milliseconds
+            ) {
+              retained.push(slot);
+              continue;
+            }
+            const [index, mirror] = await Promise.all([
+              credentials.get(credentialKey(slot.credentialHash)),
+              passkeys.get(
+                passkeyKey(current.principalHash, slot.credentialHash),
+              ),
+            ]);
+            const exactIndex =
+              index !== null &&
+              index.principalId === current.principalId &&
+              index.principalHash === current.principalHash &&
+              index.registrationId === slot.registrationId;
+            const exactMirror =
+              mirror !== null &&
+              mirror.principalId === current.principalId &&
+              mirror.principalHash === current.principalHash &&
+              mirror.registrationId === slot.registrationId;
+            if (slot.state === "reserved" && exactIndex) {
+              try {
+                await repair(index);
+                const refreshed = await principals.get(row.key);
+                const refreshedSlot = refreshed?.slots.find(
+                  (candidate) =>
+                    candidate.credentialHash === slot.credentialHash &&
+                    candidate.registrationId === slot.registrationId,
+                );
+                if (refreshedSlot !== undefined) {
+                  retained.push(refreshedSlot);
+                  continue;
+                }
+              } catch {
+                retained.push(slot);
+                continue;
+              }
+            }
+            if (exactIndex || exactMirror) {
+              retained.push(slot);
+              continue;
+            }
+            if (slot.state === "reserved") {
+              releasedReservations += 1;
+            }
+          }
+          if (!sameSlots(current.slots, retained)) {
+            await principals.putIfUnchanged(
+              { ...current, slots: retained, updatedAt: now.value },
+              row.version,
+            );
+          }
+        }
+      }
+
+      let cursor: string | null;
+      if (nextAdapterCursor !== null) {
+        cursor = `${stage}:${nextAdapterCursor}`;
+      } else {
+        const position = stages.indexOf(stage);
+        cursor =
+          position === stages.length - 1 ? null : `${stages[position + 1]}:`;
+      }
+      return Object.freeze({
+        inspected,
+        deletedProofs,
+        deletedTombstones,
+        releasedReservations,
+        cursor,
+        hasMore: cursor !== null,
+      });
     },
   };
 }

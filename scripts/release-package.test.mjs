@@ -190,8 +190,10 @@ test("trusted publishing rejects npm older than 11.5.1", () => {
 });
 
 test("runNpm invokes npm even when npm_execpath points at pnpm", () => {
-  const npmVersion = spawnSync("npm", ["--version"], {
+  const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+  const npmVersion = spawnSync(npmCommand, ["--version"], {
     encoding: "utf8",
+    shell: process.platform === "win32",
   }).stdout.trim();
   const previous = process.env.npm_execpath;
   process.env.npm_execpath = "/tmp/fake-pnpm.cjs";
