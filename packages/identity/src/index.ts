@@ -23,6 +23,7 @@ import {
   type FinishAuthenticationInput,
   type FinishRegistrationInput,
   type Passkey,
+  type PasskeySweepResult,
   type RegistrationStart,
 } from "./passkeys.js";
 import {
@@ -68,6 +69,14 @@ export interface IdentityOptions {
   readonly emailCodeTtlMs?: number;
   readonly emailCodeMaxAttempts?: number;
   readonly emailOperationRetentionMs?: number;
+  /** Maximum active or in-flight passkeys per principal. Default 10; range 1..64. */
+  readonly passkeyMaxActiveCredentials?: number;
+  /** Maximum active and revoked records per principal. Default 20; range 1..128 and not below the active limit. */
+  readonly passkeyMaxRetainedCredentials?: number;
+  /** Proof collection grace in milliseconds. Default 24 hours; maximum 30 days. */
+  readonly passkeyRegistrationProofRetentionMs?: number;
+  /** Revoked-record retention in milliseconds. Default 30 days; maximum 365 days. */
+  readonly passkeyTombstoneRetentionMs?: number;
 }
 
 export interface Identity {
@@ -97,6 +106,7 @@ export interface Identity {
     limit?: number,
     cursor?: string,
   ): Promise<ChallengeSweepResult>;
+  sweepPasskeys(limit?: number, cursor?: string): Promise<PasskeySweepResult>;
   beginAccountCreation(
     email: string,
     rateLimitKey: string,
@@ -171,6 +181,10 @@ const IDENTITY_OPTION_KEYS = new Set([
   "emailCodeTtlMs",
   "emailCodeMaxAttempts",
   "emailOperationRetentionMs",
+  "passkeyMaxActiveCredentials",
+  "passkeyMaxRetainedCredentials",
+  "passkeyRegistrationProofRetentionMs",
+  "passkeyTombstoneRetentionMs",
 ]);
 
 function snapshotOptions(value: unknown): Record<string, unknown> {
@@ -326,6 +340,36 @@ export function createIdentity(options: IdentityOptions): Identity {
     90 * 24 * 60 * 60_000,
     "Email operation retention",
   );
+  const passkeyMaxActiveCredentials = positiveBoundedInteger(
+    safe.passkeyMaxActiveCredentials as number | undefined,
+    10,
+    64,
+    "Active passkey limit",
+  );
+  const passkeyMaxRetainedCredentials = positiveBoundedInteger(
+    safe.passkeyMaxRetainedCredentials as number | undefined,
+    20,
+    128,
+    "Retained passkey limit",
+  );
+  if (passkeyMaxRetainedCredentials < passkeyMaxActiveCredentials) {
+    throw new IdentityError(
+      "invalid_input",
+      "Retained passkey limit is invalid.",
+    );
+  }
+  const passkeyRegistrationProofRetentionMs = positiveBoundedInteger(
+    safe.passkeyRegistrationProofRetentionMs as number | undefined,
+    24 * 60 * 60_000,
+    30 * 24 * 60 * 60_000,
+    "Passkey registration proof retention",
+  );
+  const passkeyTombstoneRetentionMs = positiveBoundedInteger(
+    safe.passkeyTombstoneRetentionMs as number | undefined,
+    30 * 24 * 60 * 60_000,
+    365 * 24 * 60 * 60_000,
+    "Passkey tombstone retention",
+  );
   if (
     !hasDataMethods(safe.emailCodeProtector, [
       "deriveCode",
@@ -365,6 +409,10 @@ export function createIdentity(options: IdentityOptions): Identity {
     challengeService: challenges,
     users,
     newId,
+    maxActiveCredentials: passkeyMaxActiveCredentials,
+    maxRetainedCredentials: passkeyMaxRetainedCredentials,
+    registrationProofRetentionMs: passkeyRegistrationProofRetentionMs,
+    tombstoneRetentionMs: passkeyTombstoneRetentionMs,
   });
   const emailCodes = createEmailCodeService({
     store: safe.store as Store,
@@ -399,6 +447,7 @@ export function createIdentity(options: IdentityOptions): Identity {
     removePasskey: passkeys.removePasskey,
     repairPasskey: passkeys.repairPasskey,
     sweepChallenges: challenges.sweep,
+    sweepPasskeys: passkeys.sweep,
     beginAccountCreation: emailCodes.beginAccountCreation,
     finishAccountCreation: emailCodes.finishAccountCreation,
     beginEmailSignIn: emailCodes.beginEmailSignIn,
@@ -425,6 +474,7 @@ export type {
   FinishRegistrationInput,
   IdentityErrorCode,
   Passkey,
+  PasskeySweepResult,
   ProvisionVerifiedUserInput,
   RegistrationStart,
   User,

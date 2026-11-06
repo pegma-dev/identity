@@ -38,6 +38,27 @@ One honest admission, stated rather than buried: an account recoverable by
 emailed code is exactly as secure as the mailbox behind it. Every consumer
 service works this way; almost none say it. We say it.
 
+## Passkey lifecycle settings
+
+Identity keeps passkey enrollment and removal bounded in storage. The default
+settings allow 10 active or in-flight credentials and 20 retained credential
+records per principal. Completed registration proofs become eligible for
+collection after 24 hours; proofs and capacity reservations for registrations
+that did not complete are collected after the same grace period once no
+credential record references them. Revoked credential records remain for 30
+days before collection. Hosts may set the active limit from 1 to 64 and the
+retained limit from the active limit through 128. Proof and revoked-record
+retention accept positive millisecond values up to 30 and 365 days,
+respectively. Configure them with `passkeyMaxActiveCredentials`,
+`passkeyMaxRetainedCredentials`, `passkeyRegistrationProofRetentionMs`, and
+`passkeyTombstoneRetentionMs`.
+
+Run `sweepPasskeys()` to collect eligible registration proofs, expired
+revoked records, and abandoned reservations. Persist and pass its cursor until
+`hasMore` is false, as with `sweepChallenges()`. A `limit_exceeded`
+`IdentityError` is returned when a principal has reached a configured
+credential limit.
+
 ## Development
 
 ```sh

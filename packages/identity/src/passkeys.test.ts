@@ -48,6 +48,7 @@ vi.mock("@simplewebauthn/server", () => ({
     };
   },
   async verifyRegistrationResponse(options: {
+    response: { id: string };
     expectedChallenge:
       string | ((candidate: string) => boolean | Promise<boolean>);
   }) {
@@ -64,7 +65,7 @@ vi.mock("@simplewebauthn/server", () => ({
       registrationInfo: {
         userVerified: true,
         credential: {
-          id: ceremony.credentialId,
+          id: options.response.id,
           publicKey: new Uint8Array([1, 2, 3, 4]),
           counter: ceremony.registrationCounter,
           transports: ["internal"],
@@ -114,8 +115,9 @@ import { validCounterTransition } from "./passkeys.js";
 import {
   challengesCollection,
   credentialIndexesCollection,
+  passkeyPrincipalsCollection,
   passkeysCollection,
-  type CredentialIndexRecord,
+  registrationProofsCollection,
 } from "./records.js";
 import { TABLE_PORT } from "../../../test/azurite.js";
 
@@ -221,10 +223,10 @@ function observeStore(inner: Store) {
   };
 }
 
-function registrationResponse() {
+function registrationResponse(credentialId = ceremony.credentialId) {
   return {
-    id: ceremony.credentialId,
-    rawId: ceremony.credentialId,
+    id: credentialId,
+    rawId: credentialId,
     type: "public-key" as const,
     clientExtensionResults: {},
     response: {
@@ -256,6 +258,10 @@ function service(
     readonly clock?: Clock;
     readonly newId?: () => string;
     readonly authenticationLimiter?: RateLimiter;
+    readonly passkeyMaxActiveCredentials?: number;
+    readonly passkeyMaxRetainedCredentials?: number;
+    readonly passkeyRegistrationProofRetentionMs?: number;
+    readonly passkeyTombstoneRetentionMs?: number;
   } = {},
 ) {
   return createIdentity({
@@ -273,6 +279,27 @@ function service(
     emailCodeVerificationLimiter: durableAllow,
     newId: options.newId ?? (() => randomUUID()),
     ...(options.clock === undefined ? {} : { clock: options.clock }),
+    ...(options.passkeyMaxActiveCredentials === undefined
+      ? {}
+      : {
+          passkeyMaxActiveCredentials: options.passkeyMaxActiveCredentials,
+        }),
+    ...(options.passkeyMaxRetainedCredentials === undefined
+      ? {}
+      : {
+          passkeyMaxRetainedCredentials: options.passkeyMaxRetainedCredentials,
+        }),
+    ...(options.passkeyRegistrationProofRetentionMs === undefined
+      ? {}
+      : {
+          passkeyRegistrationProofRetentionMs:
+            options.passkeyRegistrationProofRetentionMs,
+        }),
+    ...(options.passkeyTombstoneRetentionMs === undefined
+      ? {}
+      : {
+          passkeyTombstoneRetentionMs: options.passkeyTombstoneRetentionMs,
+        }),
   });
 }
 
@@ -283,6 +310,34 @@ async function provision(identity: ReturnType<typeof service>) {
     email: "person@example.test",
   });
   return principalId;
+}
+
+async function sweepPasskeysCompletely(
+  identity: ReturnType<typeof service>,
+  limit = 100,
+) {
+  let cursor: string | undefined;
+  let deletedProofs = 0;
+  let deletedTombstones = 0;
+  let releasedReservations = 0;
+  let rejected = 0;
+  for (let pass = 0; pass < 20; pass += 1) {
+    const result = await identity.sweepPasskeys(limit, cursor);
+    deletedProofs += result.deletedProofs;
+    deletedTombstones += result.deletedTombstones;
+    releasedReservations += result.releasedReservations;
+    rejected += result.rejected;
+    if (!result.hasMore) {
+      return {
+        deletedProofs,
+        deletedTombstones,
+        releasedReservations,
+        rejected,
+      };
+    }
+    cursor = result.cursor ?? undefined;
+  }
+  throw new Error("passkey maintenance did not complete");
 }
 
 beforeEach(() => {
@@ -364,6 +419,97 @@ describe("passkey ceremonies", () => {
     });
     expect(Object.isFrozen(claims)).toBe(true);
   });
+
+  it.each([
+    ["memory store", createMemoryStore],
+    ["Azurite", createAzuriteStore],
+  ] as const)(
+    "returns a durable registration when final challenge cleanup is interrupted over %s",
+    async (_name, makeStore) => {
+      const inner = makeStore();
+      let now = "2026-01-01T00:00:00.000Z";
+      let interruptConsumption = true;
+      const wrapped: Store = {
+        collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
+          const collection = inner.collection(definition);
+          if (definition.name !== challengesCollection.name) {
+            return collection;
+          }
+          return {
+            ...collection,
+            async update(key, decide, updateOptions) {
+              const interruptingDecide: typeof decide = async (current) => {
+                const decision = await decide(current);
+                if (
+                  interruptConsumption &&
+                  decision.action === "write" &&
+                  (decision.value as { state?: unknown }).state === "consumed"
+                ) {
+                  interruptConsumption = false;
+                  throw new Error("simulated challenge cleanup interruption");
+                }
+                return decision;
+              };
+              return updateOptions === undefined
+                ? collection.update(key, interruptingDecide)
+                : collection.update(key, interruptingDecide, updateOptions);
+            },
+          };
+        },
+      };
+      const identity = service(wrapped, { clock: { now: () => now } });
+      const principalId = await provision(identity);
+      const registration = await identity.beginPasskeyRegistration(
+        principalId,
+        "request-registration",
+      );
+
+      await expect(
+        identity.finishPasskeyRegistration({
+          principalId,
+          challengeHandle: registration.challengeHandle,
+          label: "Security key",
+          response: registrationResponse(),
+        }),
+      ).resolves.toMatchObject({
+        credentialId: ceremony.credentialId,
+        label: "Security key",
+      });
+      expect(interruptConsumption).toBe(false);
+
+      const challengeDigest = await challengeHandleHash(
+        registration.challengeHandle,
+      );
+      const challengeKey = {
+        partition: "challenges",
+        id: challengeDigest,
+      };
+      const retained = await inner
+        .collection(challengesCollection)
+        .get(challengeKey);
+      expect(retained).toMatchObject({ state: "verifying" });
+      await expect(
+        identity.finishPasskeyRegistration({
+          principalId,
+          challengeHandle: registration.challengeHandle,
+          label: "Repeated key",
+          response: registrationResponse(),
+        }),
+      ).rejects.toMatchObject({ code: "verification_failed" });
+      await expect(identity.listPasskeys(principalId)).resolves.toHaveLength(1);
+
+      if (retained === null) {
+        throw new Error("expected a retained challenge");
+      }
+      now = new Date(Date.parse(retained.expiresAt) + 1).toISOString();
+      await expect(identity.sweepChallenges(100)).resolves.toMatchObject({
+        deleted: 1,
+      });
+      await expect(
+        inner.collection(challengesCollection).get(challengeKey),
+      ).resolves.toBeNull();
+    },
+  );
 
   it.each([
     ["memory store", createMemoryStore],
@@ -1072,54 +1218,12 @@ describe("passkey ceremonies", () => {
     "lets only one concurrent re-registration own a revoked credential over %s",
     async (_name, makeStore) => {
       const inner = makeStore();
-      let armed = false;
-      let arrivals = 0;
-      let release!: () => void;
-      const gate = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      const racing: Store = {
-        collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
-          const collection = inner.collection(definition);
-          if (definition.name !== "pegma_identity_credential_indexes") {
-            return collection;
-          }
-          return {
-            ...collection,
-            async update(key, decide, updateOptions) {
-              const wrapped = async (current: T | null) => {
-                const decision = await decide(current);
-                const index = current as CredentialIndexRecord | null;
-                const proposed =
-                  decision.action === "write"
-                    ? (decision.value as CredentialIndexRecord)
-                    : null;
-                if (
-                  armed &&
-                  index?.state === "revoked" &&
-                  proposed?.state === "reserved"
-                ) {
-                  arrivals += 1;
-                  if (arrivals === 2) {
-                    release();
-                  }
-                  await gate;
-                }
-                return decision;
-              };
-              return updateOptions === undefined
-                ? collection.update(key, wrapped)
-                : collection.update(key, wrapped, updateOptions);
-            },
-          };
-        },
-      };
       let firstId = 0;
       let secondId = 0;
-      const first = service(racing, {
+      const first = service(inner, {
         newId: () => `first_${(firstId += 1)}`,
       });
-      const second = service(racing, {
+      const second = service(inner, {
         newId: () => `second_${(secondId += 1)}`,
       });
       const principalId = await provision(first);
@@ -1139,7 +1243,6 @@ describe("passkey ceremonies", () => {
         first.beginPasskeyRegistration(principalId, "first-race"),
         second.beginPasskeyRegistration(principalId, "second-race"),
       ]);
-      armed = true;
       const settled = await Promise.allSettled([
         first.finishPasskeyRegistration({
           principalId,
@@ -1185,6 +1288,689 @@ describe("passkey ceremonies", () => {
           result.status === "fulfilled",
       );
       expect(listed[0]?.label).toBe(fulfilled?.value.label);
+    },
+  );
+});
+
+describe("passkey lifecycle bounds", () => {
+  it("rejects passkey limits and retention settings outside their bounds", () => {
+    const cases = [
+      { passkeyMaxActiveCredentials: 0 },
+      { passkeyMaxActiveCredentials: 1.5 },
+      { passkeyMaxActiveCredentials: Number.POSITIVE_INFINITY },
+      { passkeyMaxActiveCredentials: 65 },
+      { passkeyMaxRetainedCredentials: 0 },
+      { passkeyMaxRetainedCredentials: 129 },
+      {
+        passkeyMaxActiveCredentials: 2,
+        passkeyMaxRetainedCredentials: 1,
+      },
+      { passkeyRegistrationProofRetentionMs: 0 },
+      { passkeyRegistrationProofRetentionMs: 30 * 24 * 60 * 60_000 + 1 },
+      { passkeyTombstoneRetentionMs: 0 },
+      { passkeyTombstoneRetentionMs: 365 * 24 * 60 * 60_000 + 1 },
+    ];
+    for (const options of cases) {
+      expect(() => service(createMemoryStore(), options)).toThrow(
+        IdentityError,
+      );
+    }
+  });
+
+  it.each([
+    ["memory store", createMemoryStore],
+    ["Azurite", createAzuriteStore],
+  ] as const)(
+    "retains malformed maintenance rows and continues each scan over %s",
+    async (_name, makeStore) => {
+      const inner = makeStore();
+      let now = "2026-08-31T12:00:00.000Z";
+      const identity = service(inner, {
+        clock: { now: () => now },
+        passkeyRegistrationProofRetentionMs: 1_000,
+        passkeyTombstoneRetentionMs: 1_000,
+      });
+      const principalId = await provision(identity);
+      const registration = await identity.beginPasskeyRegistration(
+        principalId,
+        "maintenance-registration",
+      );
+      await identity.finishPasskeyRegistration({
+        principalId,
+        challengeHandle: registration.challengeHandle,
+        label: "Maintenance key",
+        response: registrationResponse("maintenance_credential"),
+      });
+      await identity.removePasskey(principalId, "maintenance_credential");
+
+      const malformedId = "0".repeat(64);
+      for (const [name, partition] of [
+        [
+          registrationProofsCollection.name,
+          `registration-${malformedId.slice(0, 16)}`,
+        ],
+        [
+          credentialIndexesCollection.name,
+          `credential-${malformedId.slice(0, 16)}`,
+        ],
+        [passkeysCollection.name, `passkeys-${malformedId.slice(0, 32)}`],
+        [
+          passkeyPrincipalsCollection.name,
+          `passkeys-${malformedId.slice(0, 32)}`,
+        ],
+      ] as const) {
+        const raw = defineCollection<StoredRecord>({
+          name,
+          key: (record) => ({
+            partition: String(record.partition),
+            id: String(record.id),
+          }),
+          codec: {
+            encode: (record) => record,
+            decode: (record) => record,
+          },
+        });
+        await inner.collection(raw).put({
+          partition,
+          id: malformedId,
+          malformed: true,
+        });
+      }
+
+      now = "2026-08-31T12:00:02.000Z";
+      await expect(sweepPasskeysCompletely(identity, 1)).resolves.toEqual({
+        deletedProofs: 1,
+        deletedTombstones: 1,
+        releasedReservations: 0,
+        rejected: 4,
+      });
+    },
+  );
+
+  it.each([
+    ["memory store", createMemoryStore],
+    ["Azurite", createAzuriteStore],
+  ] as const)(
+    "reconciles a stale reservation with the committed credential generation over %s",
+    async (_name, makeStore) => {
+      const inner = makeStore();
+      const identity = service(inner, {
+        passkeyMaxActiveCredentials: 2,
+        passkeyMaxRetainedCredentials: 2,
+      });
+      const principalId = await provision(identity);
+      const registration = await identity.beginPasskeyRegistration(
+        principalId,
+        "initial-registration",
+      );
+      await identity.finishPasskeyRegistration({
+        principalId,
+        challengeHandle: registration.challengeHandle,
+        label: "Initial key",
+        response: registrationResponse("reconciled_credential"),
+      });
+      const principalDigest = await principalHash(principalId);
+      const credentialDigest = await credentialHash("reconciled_credential");
+      const principalKey = {
+        partition: `passkeys-${principalDigest.slice(0, 32)}`,
+        id: principalDigest,
+      };
+      const principalRecords = inner.collection(passkeyPrincipalsCollection);
+      const state = await principalRecords.get(principalKey);
+      const mirror = await inner.collection(passkeysCollection).get({
+        partition: principalKey.partition,
+        id: credentialDigest,
+      });
+      if (state === null || mirror === null) {
+        throw new Error("expected passkey state");
+      }
+      await principalRecords.put({
+        ...state,
+        slots: [
+          {
+            ...state.slots[0]!,
+            registrationId: "stale_generation",
+            state: "reserved",
+            expiresAt: "2027-09-30T12:00:00.000Z",
+          },
+        ],
+      });
+
+      await expect(
+        identity.beginPasskeyRegistration(principalId, "after-reconcile"),
+      ).resolves.toMatchObject({ challengeHandle: expect.any(String) });
+      await expect(principalRecords.get(principalKey)).resolves.toMatchObject({
+        slots: [
+          {
+            registrationId: mirror.registrationId,
+            state: "active",
+            expiresAt: null,
+          },
+        ],
+      });
+    },
+  );
+
+  it.each([
+    ["memory store", createMemoryStore],
+    ["Azurite", createAzuriteStore],
+  ] as const)(
+    "removes an active credential whose stored records predate retention fields over %s",
+    async (_name, makeStore) => {
+      const inner = makeStore();
+      const identity = service(inner);
+      const principalId = await provision(identity);
+      const registration = await identity.beginPasskeyRegistration(
+        principalId,
+        "legacy-record",
+      );
+      await identity.finishPasskeyRegistration({
+        principalId,
+        challengeHandle: registration.challengeHandle,
+        label: "Legacy key",
+        response: registrationResponse("legacy_credential"),
+      });
+      const credentialDigest = await credentialHash("legacy_credential");
+      const principalDigest = await principalHash(principalId);
+      for (const [definition, key] of [
+        [
+          credentialIndexesCollection,
+          {
+            partition: `credential-${credentialDigest.slice(0, 16)}`,
+            id: credentialDigest,
+          },
+        ],
+        [
+          passkeysCollection,
+          {
+            partition: `passkeys-${principalDigest.slice(0, 32)}`,
+            id: credentialDigest,
+          },
+        ],
+      ] as const) {
+        const raw = defineCollection<StoredRecord>({
+          name: definition.name,
+          key: (record) => ({
+            partition: String(record.partition),
+            id: String(record.id),
+          }),
+          codec: {
+            encode: (record) => record,
+            decode: (record) => record,
+          },
+        });
+        const collection = inner.collection(raw);
+        const stored = await collection.get(key);
+        if (stored === null) {
+          throw new Error("expected stored credential record");
+        }
+        const { retireAt: _retireAt, ...legacy } = stored;
+        await collection.put(legacy);
+      }
+
+      await expect(
+        identity.removePasskey(principalId, "legacy_credential"),
+      ).resolves.toBe(true);
+    },
+  );
+
+  it.each([
+    ["memory store with a mirror", createMemoryStore, true],
+    ["memory store without a mirror", createMemoryStore, false],
+    ["Azurite with a mirror", createAzuriteStore, true],
+    ["Azurite without a mirror", createAzuriteStore, false],
+  ] as const)(
+    "repairs a revoked credential whose stored records predate retention fields over %s",
+    async (_name, makeStore, keepMirror) => {
+      const inner = makeStore();
+      const identity = service(inner);
+      const principalId = await provision(identity);
+      const registration = await identity.beginPasskeyRegistration(
+        principalId,
+        "legacy-revoked-record",
+      );
+      await identity.finishPasskeyRegistration({
+        principalId,
+        challengeHandle: registration.challengeHandle,
+        label: "Retired key",
+        response: registrationResponse("legacy_revoked_credential"),
+      });
+      await identity.removePasskey(principalId, "legacy_revoked_credential");
+
+      const credentialDigest = await credentialHash(
+        "legacy_revoked_credential",
+      );
+      const principalDigest = await principalHash(principalId);
+      const indexKey = {
+        partition: `credential-${credentialDigest.slice(0, 16)}`,
+        id: credentialDigest,
+      };
+      const mirrorKey = {
+        partition: `passkeys-${principalDigest.slice(0, 32)}`,
+        id: credentialDigest,
+      };
+      const principalKey = {
+        partition: mirrorKey.partition,
+        id: principalDigest,
+      };
+      const raw = (name: string) =>
+        inner.collection(
+          defineCollection<StoredRecord>({
+            name,
+            key: (record) => ({
+              partition: String(record.partition),
+              id: String(record.id),
+            }),
+            codec: {
+              encode: (record) => record,
+              decode: (record) => record,
+            },
+          }),
+        );
+      for (const [name, key] of [
+        [credentialIndexesCollection.name, indexKey],
+        [passkeysCollection.name, mirrorKey],
+      ] as const) {
+        const collection = raw(name);
+        const stored = await collection.get(key);
+        if (stored === null) {
+          throw new Error("expected stored revoked credential record");
+        }
+        const { retireAt: _retireAt, ...legacy } = stored;
+        await collection.put(legacy);
+      }
+      await inner.collection(passkeyPrincipalsCollection).delete(principalKey);
+      if (!keepMirror) {
+        await inner.collection(passkeysCollection).delete(mirrorKey);
+      }
+
+      const restarted = service(inner);
+      await expect(
+        restarted.repairPasskey("legacy_revoked_credential"),
+      ).resolves.toBeNull();
+      await expect(
+        restarted.removePasskey(principalId, "legacy_revoked_credential"),
+      ).resolves.toBe(false);
+      await expect(
+        inner.collection(passkeyPrincipalsCollection).get(principalKey),
+      ).resolves.toMatchObject({
+        slots: [
+          {
+            credentialHash: credentialDigest,
+            state: "revoked",
+            expiresAt: expect.any(String),
+          },
+        ],
+      });
+      await expect(
+        restarted.beginPasskeyRegistration(principalId, "after-legacy-repair"),
+      ).resolves.toMatchObject({ challengeHandle: expect.any(String) });
+    },
+  );
+
+  it.each([
+    ["memory store", createMemoryStore],
+    ["Azurite", createAzuriteStore],
+  ] as const)(
+    "enforces the active credential limit before and after verification over %s",
+    async (_name, makeStore) => {
+      const inner = makeStore();
+      const identity = service(inner, {
+        passkeyMaxActiveCredentials: 1,
+        passkeyMaxRetainedCredentials: 2,
+      });
+      const principalId = await provision(identity);
+      const [first, waiting] = await Promise.all([
+        identity.beginPasskeyRegistration(principalId, "first"),
+        identity.beginPasskeyRegistration(principalId, "waiting"),
+      ]);
+      await identity.finishPasskeyRegistration({
+        principalId,
+        challengeHandle: first.challengeHandle,
+        label: "First key",
+        response: registrationResponse("quota_first"),
+      });
+
+      await expect(
+        identity.finishPasskeyRegistration({
+          principalId,
+          challengeHandle: waiting.challengeHandle,
+          label: "Waiting key",
+          response: registrationResponse("quota_waiting"),
+        }),
+      ).rejects.toMatchObject({ code: "limit_exceeded" });
+      await expect(
+        identity.beginPasskeyRegistration(principalId, "after-limit"),
+      ).rejects.toMatchObject({ code: "limit_exceeded" });
+      await expect(identity.listPasskeys(principalId)).resolves.toHaveLength(1);
+
+      const digest = await principalHash(principalId);
+      await expect(
+        inner
+          .collection(passkeyPrincipalsCollection)
+          .get({ partition: `passkeys-${digest.slice(0, 32)}`, id: digest }),
+      ).resolves.toMatchObject({
+        slots: [{ state: "active" }],
+      });
+    },
+  );
+
+  it.each([
+    ["memory store", createMemoryStore],
+    ["Azurite", createAzuriteStore],
+  ] as const)(
+    "serializes concurrent registrations at the active credential limit over %s",
+    async (_name, makeStore) => {
+      const identity = service(makeStore(), {
+        passkeyMaxActiveCredentials: 1,
+        passkeyMaxRetainedCredentials: 2,
+      });
+      const principalId = await provision(identity);
+      const [first, second] = await Promise.all([
+        identity.beginPasskeyRegistration(principalId, "first-race"),
+        identity.beginPasskeyRegistration(principalId, "second-race"),
+      ]);
+
+      const settled = await Promise.allSettled([
+        identity.finishPasskeyRegistration({
+          principalId,
+          challengeHandle: first.challengeHandle,
+          label: "First key",
+          response: registrationResponse("quota_race_first"),
+        }),
+        identity.finishPasskeyRegistration({
+          principalId,
+          challengeHandle: second.challengeHandle,
+          label: "Second key",
+          response: registrationResponse("quota_race_second"),
+        }),
+      ]);
+
+      expect(
+        settled.filter(({ status }) => status === "fulfilled"),
+      ).toHaveLength(1);
+      const rejected = settled.find(
+        (result): result is PromiseRejectedResult =>
+          result.status === "rejected",
+      );
+      expect(rejected?.reason).toMatchObject({ code: "limit_exceeded" });
+      await expect(identity.listPasskeys(principalId)).resolves.toHaveLength(1);
+    },
+  );
+
+  it.each([
+    ["memory store", createMemoryStore],
+    ["Azurite", createAzuriteStore],
+  ] as const)(
+    "collects completed and unreferenced registration state after its grace period over %s",
+    async (_name, makeStore) => {
+      const inner = makeStore();
+      let now = "2026-09-01T12:00:00.000Z";
+      const options = {
+        clock: { now: () => now },
+        passkeyMaxActiveCredentials: 1,
+        passkeyMaxRetainedCredentials: 1,
+        passkeyRegistrationProofRetentionMs: 1_000,
+      };
+      const first = service(inner, options);
+      const second = service(inner, options);
+      const firstPrincipal = await provision(first);
+      const secondPrincipal = "principal-passkeys-second" as PrincipalId;
+      await second.provisionVerifiedUser({
+        principalId: secondPrincipal,
+        email: "second@example.test",
+      });
+      const [firstStart, secondStart] = await Promise.all([
+        first.beginPasskeyRegistration(firstPrincipal, "first"),
+        second.beginPasskeyRegistration(secondPrincipal, "second"),
+      ]);
+
+      const settled = await Promise.allSettled([
+        first.finishPasskeyRegistration({
+          principalId: firstPrincipal,
+          challengeHandle: firstStart.challengeHandle,
+          label: "First key",
+          response: registrationResponse("shared_credential"),
+        }),
+        second.finishPasskeyRegistration({
+          principalId: secondPrincipal,
+          challengeHandle: secondStart.challengeHandle,
+          label: "Second key",
+          response: registrationResponse("shared_credential"),
+        }),
+      ]);
+      expect(
+        settled.filter(({ status }) => status === "fulfilled"),
+      ).toHaveLength(1);
+      expect(
+        settled.filter(({ status }) => status === "rejected"),
+      ).toHaveLength(1);
+      const before = await inner
+        .collection(registrationProofsCollection)
+        .scan({ limit: 10 });
+      expect(before.records).toHaveLength(2);
+
+      now = "2026-09-01T12:00:02.000Z";
+      const swept = await sweepPasskeysCompletely(first, 1);
+      expect(swept.deletedProofs).toBe(2);
+      expect(swept.releasedReservations).toBe(1);
+      const after = await inner
+        .collection(registrationProofsCollection)
+        .scan({ limit: 10 });
+      expect(after.records).toHaveLength(0);
+
+      const losingPrincipal =
+        settled[0]?.status === "rejected" ? firstPrincipal : secondPrincipal;
+      await expect(
+        first.beginPasskeyRegistration(losingPrincipal, "after-maintenance"),
+      ).resolves.toMatchObject({ challengeHandle: expect.any(String) });
+    },
+  );
+
+  it.each([
+    ["memory store", createMemoryStore],
+    ["Azurite", createAzuriteStore],
+  ] as const)(
+    "compacts expired revoked records while retaining an active credential over %s",
+    async (_name, makeStore) => {
+      const inner = makeStore();
+      let now = "2026-09-02T12:00:00.000Z";
+      const identity = service(inner, {
+        clock: { now: () => now },
+        passkeyMaxActiveCredentials: 2,
+        passkeyMaxRetainedCredentials: 2,
+        passkeyRegistrationProofRetentionMs: 1_000,
+        passkeyTombstoneRetentionMs: 1_000,
+      });
+      const principalId = await provision(identity);
+      const first = await identity.beginPasskeyRegistration(
+        principalId,
+        "first",
+      );
+      await identity.finishPasskeyRegistration({
+        principalId,
+        challengeHandle: first.challengeHandle,
+        label: "First key",
+        response: registrationResponse("retired_credential"),
+      });
+      const second = await identity.beginPasskeyRegistration(
+        principalId,
+        "second",
+      );
+      await identity.finishPasskeyRegistration({
+        principalId,
+        challengeHandle: second.challengeHandle,
+        label: "Second key",
+        response: registrationResponse("active_credential"),
+      });
+      await expect(
+        identity.removePasskey(principalId, "retired_credential"),
+      ).resolves.toBe(true);
+      await expect(sweepPasskeysCompletely(identity)).resolves.toMatchObject({
+        deletedTombstones: 0,
+      });
+
+      now = "2026-09-02T12:00:02.000Z";
+      await expect(sweepPasskeysCompletely(identity, 1)).resolves.toMatchObject(
+        { deletedTombstones: 1 },
+      );
+      const retiredDigest = await credentialHash("retired_credential");
+      const principalDigest = await principalHash(principalId);
+      await expect(
+        inner.collection(credentialIndexesCollection).get({
+          partition: `credential-${retiredDigest.slice(0, 16)}`,
+          id: retiredDigest,
+        }),
+      ).resolves.toBeNull();
+      await expect(
+        inner.collection(passkeysCollection).get({
+          partition: `passkeys-${principalDigest.slice(0, 32)}`,
+          id: retiredDigest,
+        }),
+      ).resolves.toBeNull();
+      await expect(identity.listPasskeys(principalId)).resolves.toMatchObject([
+        { credentialId: "active_credential" },
+      ]);
+
+      ceremony.credentialId = "active_credential";
+      const authentication = await identity.beginPasskeyAuthentication(
+        "active-after-maintenance",
+      );
+      await expect(
+        identity.finishPasskeyAuthentication({
+          challengeHandle: authentication.challengeHandle,
+          response: authenticationResponse(),
+        }),
+      ).resolves.toMatchObject({ subject: principalId });
+    },
+  );
+
+  it.each([
+    ["memory store", createMemoryStore],
+    ["Azurite", createAzuriteStore],
+  ] as const)(
+    "commits removal after a concurrent counter transition over %s",
+    async (_name, makeStore) => {
+      const inner = makeStore();
+      let armed = false;
+      let removalObserved!: () => void;
+      let pendingWritten!: () => void;
+      let resumeAuthentication!: () => void;
+      const removalReachedUpdate = new Promise<void>((resolve) => {
+        removalObserved = resolve;
+      });
+      const counterPending = new Promise<void>((resolve) => {
+        pendingWritten = resolve;
+      });
+      const authenticationMayResume = new Promise<void>((resolve) => {
+        resumeAuthentication = resolve;
+      });
+      let heldRemoval = false;
+      let heldAuthentication = false;
+      const racing: Store = {
+        collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
+          const collection = inner.collection(definition);
+          if (definition.name !== "pegma_identity_credential_indexes") {
+            return collection;
+          }
+          return {
+            ...collection,
+            async update(key, decide, updateOptions) {
+              const wrapped = async (current: T | null) => {
+                const decision = await decide(current);
+                const currentState = (current as { state?: string } | null)
+                  ?.state;
+                const proposedState =
+                  decision.action === "write"
+                    ? (decision.value as { state?: string }).state
+                    : undefined;
+                if (
+                  armed &&
+                  !heldRemoval &&
+                  currentState === "active" &&
+                  proposedState === "revoked"
+                ) {
+                  heldRemoval = true;
+                  removalObserved();
+                  await counterPending;
+                }
+                return decision;
+              };
+              const result =
+                updateOptions === undefined
+                  ? await collection.update(key, wrapped)
+                  : await collection.update(key, wrapped, updateOptions);
+              if (
+                armed &&
+                !heldAuthentication &&
+                result.written &&
+                (result.value as { state?: string } | null)?.state ===
+                  "counter-pending"
+              ) {
+                heldAuthentication = true;
+                pendingWritten();
+                await authenticationMayResume;
+              }
+              return result;
+            },
+          };
+        },
+      };
+      const identity = service(racing);
+      const principalId = await provision(identity);
+      ceremony.registrationCounter = 1;
+      const registration = await identity.beginPasskeyRegistration(
+        principalId,
+        "registration",
+      );
+      await identity.finishPasskeyRegistration({
+        principalId,
+        challengeHandle: registration.challengeHandle,
+        label: "Security key",
+        response: registrationResponse(),
+      });
+      ceremony.authenticationCounter = 2;
+      const authentication = await identity.beginPasskeyAuthentication(
+        "concurrent-authentication",
+      );
+
+      armed = true;
+      const removing = identity.removePasskey(
+        principalId,
+        ceremony.credentialId,
+      );
+      await removalReachedUpdate;
+      const authenticating = identity.finishPasskeyAuthentication({
+        challengeHandle: authentication.challengeHandle,
+        response: authenticationResponse(),
+      });
+      await counterPending;
+      await expect(removing).resolves.toBe(true);
+
+      const digest = await credentialHash(ceremony.credentialId);
+      const principalDigest = await principalHash(principalId);
+      await expect(
+        inner.collection(credentialIndexesCollection).get({
+          partition: `credential-${digest.slice(0, 16)}`,
+          id: digest,
+        }),
+      ).resolves.toMatchObject({ state: "revoked" });
+      await expect(
+        inner.collection(passkeysCollection).get({
+          partition: `passkeys-${principalDigest.slice(0, 32)}`,
+          id: digest,
+        }),
+      ).resolves.toMatchObject({ state: "revoked" });
+
+      resumeAuthentication();
+      await expect(authenticating).rejects.toBeInstanceOf(IdentityError);
+      const after = await identity.beginPasskeyAuthentication("after-removal");
+      await expect(
+        identity.finishPasskeyAuthentication({
+          challengeHandle: after.challengeHandle,
+          response: authenticationResponse(),
+        }),
+      ).rejects.toMatchObject({ code: "verification_failed" });
     },
   );
 });
