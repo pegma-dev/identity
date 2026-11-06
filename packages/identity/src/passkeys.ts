@@ -880,6 +880,11 @@ export function createPasskeyService(
     state: "active" | "revoked",
     expiresAt: string | null,
   ): Promise<void> {
+    const normalizedExpiresAt =
+      state === "revoked"
+        ? (expiresAt ??
+          after(Date.parse(index.updatedAt), options.tombstoneRetentionMs))
+        : null;
     const key = passkeyPrincipalKey(index.principalHash);
     const result = await principals.update(
       key,
@@ -900,13 +905,34 @@ export function createPasskeyService(
             slot.registrationId === index.registrationId,
         );
         if (position < 0) {
-          return { action: "keep" };
+          if (state !== "revoked") {
+            return { action: "keep" };
+          }
+          return {
+            action: "write",
+            value: {
+              ...current,
+              slots: [
+                ...current.slots,
+                {
+                  credentialHash: index.credentialHash,
+                  registrationId: index.registrationId,
+                  state,
+                  expiresAt: normalizedExpiresAt,
+                  updatedAt: index.updatedAt,
+                },
+              ].sort((left, right) =>
+                left.credentialHash.localeCompare(right.credentialHash),
+              ),
+              updatedAt: index.updatedAt,
+            },
+          };
         }
         const slots = [...current.slots];
         slots[position] = {
           ...slots[position]!,
           state,
-          expiresAt,
+          expiresAt: normalizedExpiresAt,
           updatedAt: index.updatedAt,
         };
         return {
@@ -921,7 +947,7 @@ export function createPasskeyService(
         candidate.credentialHash === index.credentialHash &&
         candidate.registrationId === index.registrationId,
     );
-    if (slot?.state !== state || slot.expiresAt !== expiresAt) {
+    if (slot?.state !== state || slot.expiresAt !== normalizedExpiresAt) {
       throw new IdentityError(
         "storage_corrupt",
         "Stored passkey principal state is malformed.",
@@ -1792,9 +1818,10 @@ export function createPasskeyService(
             passkeyKey(principalDigest, digest),
           );
           if (
-            mirror?.state !== "revoked" ||
-            !sameCredentialBinding(mirror, observed) ||
-            mirror.retireAt !== observed.retireAt
+            mirror !== null &&
+            (mirror.state !== "revoked" ||
+              !sameCredentialBinding(mirror, observed) ||
+              mirror.retireAt !== observed.retireAt)
           ) {
             throw new IdentityError(
               "conflict",

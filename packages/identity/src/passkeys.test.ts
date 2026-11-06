@@ -1515,6 +1515,100 @@ describe("passkey lifecycle bounds", () => {
   );
 
   it.each([
+    ["memory store with a mirror", createMemoryStore, true],
+    ["memory store without a mirror", createMemoryStore, false],
+    ["Azurite with a mirror", createAzuriteStore, true],
+    ["Azurite without a mirror", createAzuriteStore, false],
+  ] as const)(
+    "repairs a revoked credential whose stored records predate retention fields over %s",
+    async (_name, makeStore, keepMirror) => {
+      const inner = makeStore();
+      const identity = service(inner);
+      const principalId = await provision(identity);
+      const registration = await identity.beginPasskeyRegistration(
+        principalId,
+        "legacy-revoked-record",
+      );
+      await identity.finishPasskeyRegistration({
+        principalId,
+        challengeHandle: registration.challengeHandle,
+        label: "Retired key",
+        response: registrationResponse("legacy_revoked_credential"),
+      });
+      await identity.removePasskey(principalId, "legacy_revoked_credential");
+
+      const credentialDigest = await credentialHash(
+        "legacy_revoked_credential",
+      );
+      const principalDigest = await principalHash(principalId);
+      const indexKey = {
+        partition: `credential-${credentialDigest.slice(0, 16)}`,
+        id: credentialDigest,
+      };
+      const mirrorKey = {
+        partition: `passkeys-${principalDigest.slice(0, 32)}`,
+        id: credentialDigest,
+      };
+      const principalKey = {
+        partition: mirrorKey.partition,
+        id: principalDigest,
+      };
+      const raw = (name: string) =>
+        inner.collection(
+          defineCollection<StoredRecord>({
+            name,
+            key: (record) => ({
+              partition: String(record.partition),
+              id: String(record.id),
+            }),
+            codec: {
+              encode: (record) => record,
+              decode: (record) => record,
+            },
+          }),
+        );
+      for (const [name, key] of [
+        [credentialIndexesCollection.name, indexKey],
+        [passkeysCollection.name, mirrorKey],
+      ] as const) {
+        const collection = raw(name);
+        const stored = await collection.get(key);
+        if (stored === null) {
+          throw new Error("expected stored revoked credential record");
+        }
+        const { retireAt: _retireAt, ...legacy } = stored;
+        await collection.put(legacy);
+      }
+      await inner.collection(passkeyPrincipalsCollection).delete(principalKey);
+      if (!keepMirror) {
+        await inner.collection(passkeysCollection).delete(mirrorKey);
+      }
+
+      const restarted = service(inner);
+      await expect(
+        restarted.repairPasskey("legacy_revoked_credential"),
+      ).resolves.toBeNull();
+      await expect(
+        restarted.removePasskey(principalId, "legacy_revoked_credential"),
+      ).resolves.toBe(false);
+      await expect(
+        inner.collection(passkeyPrincipalsCollection).get(principalKey),
+      ).resolves.toMatchObject({
+        slots: [
+          {
+            credentialHash: credentialDigest,
+            state: "revoked",
+            expiresAt: expect.any(String),
+          },
+        ],
+      });
+      await expect(
+        restarted.beginPasskeyRegistration(principalId, "after-legacy-repair"),
+      ).resolves.toMatchObject({ challengeHandle: expect.any(String) });
+    },
+  );
+
+  it.each([
     ["memory store", createMemoryStore],
     ["Azurite", createAzuriteStore],
   ] as const)(
