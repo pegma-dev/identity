@@ -1,6 +1,11 @@
 import type { RateLimiter } from "@pegma/rate-limit";
 import type { Clock, PrincipalId } from "@pegma/spine";
-import type { Store } from "@pegma/storage-core";
+import {
+  defineCollection,
+  type CollectionDefinition,
+  type Store,
+  type StoredRecord,
+} from "@pegma/storage-core";
 import {
   generateAuthenticationOptions,
   generateRegistrationOptions,
@@ -116,8 +121,220 @@ export interface PasskeySweepResult {
   readonly deletedProofs: number;
   readonly deletedTombstones: number;
   readonly releasedReservations: number;
+  readonly rejected: number;
   readonly cursor: string | null;
   readonly hasMore: boolean;
+}
+
+interface SafePasskeyScanRecord {
+  readonly key: { readonly partition: string; readonly id: string };
+  readonly value: unknown;
+  readonly version: string;
+}
+
+interface SafePasskeyScanPage {
+  readonly records: readonly unknown[];
+  readonly nextCursor: string | null;
+}
+
+function passkeyScanCollection(name: string) {
+  return defineCollection<StoredRecord>({
+    name,
+    key: (record) => ({
+      partition: String(record.partition),
+      id: String(record.id),
+    }),
+    codec: {
+      encode: (record) => record,
+      decode: (record) => record,
+    },
+  });
+}
+
+const registrationProofScanCollection = passkeyScanCollection(
+  registrationProofsCollection.name,
+);
+const credentialIndexScanCollection = passkeyScanCollection(
+  credentialIndexesCollection.name,
+);
+const passkeyMirrorScanCollection = passkeyScanCollection(
+  passkeysCollection.name,
+);
+const passkeyPrincipalScanCollection = passkeyScanCollection(
+  passkeyPrincipalsCollection.name,
+);
+
+function passkeyScanOwnData(value: object, name: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, name);
+  if (
+    descriptor === undefined ||
+    !descriptor.enumerable ||
+    !("value" in descriptor)
+  ) {
+    throw new IdentityError(
+      "invalid_state",
+      "Passkey scan returned malformed data.",
+    );
+  }
+  return descriptor.value;
+}
+
+function passkeyScanRecord(value: unknown): SafePasskeyScanRecord {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new IdentityError(
+      "invalid_state",
+      "Passkey scan returned malformed data.",
+    );
+  }
+  const prototype = Object.getPrototypeOf(value);
+  const keys = Reflect.ownKeys(Object.getOwnPropertyDescriptors(value));
+  if (
+    (prototype !== Object.prototype && prototype !== null) ||
+    keys.length !== 3 ||
+    keys.some(
+      (key) =>
+        typeof key === "symbol" ||
+        (key !== "key" && key !== "value" && key !== "version"),
+    )
+  ) {
+    throw new IdentityError(
+      "invalid_state",
+      "Passkey scan returned malformed data.",
+    );
+  }
+  const key = passkeyScanOwnData(value, "key");
+  const record = passkeyScanOwnData(value, "value");
+  const version = passkeyScanOwnData(value, "version");
+  if (
+    typeof key !== "object" ||
+    key === null ||
+    Array.isArray(key) ||
+    (Object.getPrototypeOf(key) !== Object.prototype &&
+      Object.getPrototypeOf(key) !== null) ||
+    Reflect.ownKeys(Object.getOwnPropertyDescriptors(key)).length !== 2 ||
+    typeof version !== "string" ||
+    version.length === 0 ||
+    version.length > 16_384
+  ) {
+    throw new IdentityError(
+      "invalid_state",
+      "Passkey scan returned malformed data.",
+    );
+  }
+  const partition = passkeyScanOwnData(key, "partition");
+  const id = passkeyScanOwnData(key, "id");
+  if (
+    typeof partition !== "string" ||
+    partition.length === 0 ||
+    partition.length > 1_024 ||
+    typeof id !== "string" ||
+    id.length === 0 ||
+    id.length > 1_024
+  ) {
+    throw new IdentityError(
+      "invalid_state",
+      "Passkey scan returned malformed data.",
+    );
+  }
+  return Object.freeze({
+    key: Object.freeze({ partition, id }),
+    value: record,
+    version,
+  });
+}
+
+function passkeyScanPage(value: unknown, limit: number): SafePasskeyScanPage {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new IdentityError(
+      "invalid_state",
+      "Passkey scan returned malformed data.",
+    );
+  }
+  const prototype = Object.getPrototypeOf(value);
+  const keys = Reflect.ownKeys(Object.getOwnPropertyDescriptors(value));
+  if (
+    (prototype !== Object.prototype && prototype !== null) ||
+    keys.length !== 2 ||
+    keys.some(
+      (key) =>
+        typeof key === "symbol" || (key !== "records" && key !== "nextCursor"),
+    )
+  ) {
+    throw new IdentityError(
+      "invalid_state",
+      "Passkey scan returned malformed data.",
+    );
+  }
+  const records = passkeyScanOwnData(value, "records");
+  const nextCursor = passkeyScanOwnData(value, "nextCursor");
+  if (
+    !Array.isArray(records) ||
+    records.length > limit ||
+    (nextCursor !== null &&
+      (typeof nextCursor !== "string" ||
+        nextCursor.length === 0 ||
+        nextCursor.length > 16_384))
+  ) {
+    throw new IdentityError(
+      "invalid_state",
+      "Passkey scan returned malformed data.",
+    );
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(records);
+  const safeRecords: unknown[] = [];
+  for (let index = 0; index < records.length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (
+      descriptor === undefined ||
+      !descriptor.enumerable ||
+      !("value" in descriptor)
+    ) {
+      throw new IdentityError(
+        "invalid_state",
+        "Passkey scan returned malformed data.",
+      );
+    }
+    safeRecords.push(descriptor.value);
+  }
+  if (
+    Reflect.ownKeys(descriptors).filter((key) => key !== "length").length !==
+    records.length
+  ) {
+    throw new IdentityError(
+      "invalid_state",
+      "Passkey scan returned malformed data.",
+    );
+  }
+  return Object.freeze({
+    records: Object.freeze(safeRecords),
+    nextCursor,
+  });
+}
+
+function decodePasskeyScanRecord<T>(
+  raw: unknown,
+  definition: CollectionDefinition<T>,
+): { readonly row: SafePasskeyScanRecord; readonly value: T } {
+  const row = passkeyScanRecord(raw);
+  if (
+    typeof row.value !== "object" ||
+    row.value === null ||
+    Array.isArray(row.value)
+  ) {
+    throw new IdentityError(
+      "storage_corrupt",
+      "Stored passkey maintenance record is malformed.",
+    );
+  }
+  const value = definition.codec.decode(row.value as StoredRecord);
+  const key = definition.key(value);
+  if (row.key.partition !== key.partition || row.key.id !== key.id) {
+    throw new IdentityError(
+      "storage_corrupt",
+      "Stored passkey maintenance record is malformed.",
+    );
+  }
+  return Object.freeze({ row, value });
 }
 
 function passkeyPartition(hash: string): string {
@@ -168,7 +385,7 @@ function activeUser(user: User | null): asserts user is User {
 }
 
 async function assertCredentialOwner(
-  index: CredentialIndexRecord,
+  index: Pick<CredentialIndexRecord, "principalId" | "principalHash">,
 ): Promise<void> {
   const principalId = readDataProperty(index, "principalId");
   const storedDigest = readDataProperty(index, "principalHash");
@@ -374,6 +591,18 @@ export function createPasskeyService(
     registrationProofsCollection,
   );
   const principals = options.store.collection(passkeyPrincipalsCollection);
+  const registrationProofScan = options.store.collection(
+    registrationProofScanCollection,
+  );
+  const credentialIndexScan = options.store.collection(
+    credentialIndexScanCollection,
+  );
+  const passkeyMirrorScan = options.store.collection(
+    passkeyMirrorScanCollection,
+  );
+  const passkeyPrincipalScan = options.store.collection(
+    passkeyPrincipalScanCollection,
+  );
 
   async function assertPrincipalStateOwner(
     state: PasskeyPrincipalRecord,
@@ -456,7 +685,37 @@ export function createPasskeyService(
           "Stored passkey principal state is malformed.",
         );
       }
-      if (current?.state !== "reserved") {
+      if (current?.state === "reserved") {
+        const index = await credentials.get(
+          credentialKey(mirror.credentialHash),
+        );
+        if (index !== null) {
+          await assertCredentialOwner(index);
+        }
+        if (
+          index !== null &&
+          index.principalId === principalId &&
+          index.principalHash === principalDigest &&
+          index.registrationId === mirror.registrationId &&
+          index.state !== "reserved"
+        ) {
+          slots[position] = next;
+          continue;
+        }
+        if (
+          index !== null &&
+          index.principalId === principalId &&
+          index.principalHash === principalDigest &&
+          index.registrationId === current.registrationId &&
+          index.state === "reserved"
+        ) {
+          continue;
+        }
+        throw new IdentityError(
+          "storage_corrupt",
+          "Stored passkey principal state is malformed.",
+        );
+      } else {
         slots[position] = next;
       }
     }
@@ -1693,17 +1952,32 @@ export function createPasskeyService(
       let deletedProofs = 0;
       let deletedTombstones = 0;
       let releasedReservations = 0;
+      let rejected = 0;
       let nextAdapterCursor: string | null;
 
       if (stage === "proofs") {
-        const page = await registrationProofs.scan({
-          limit: limitInput,
-          ...(adapterCursor === undefined ? {} : { cursor: adapterCursor }),
-        });
+        const page = passkeyScanPage(
+          await registrationProofScan.scan({
+            limit: limitInput,
+            ...(adapterCursor === undefined ? {} : { cursor: adapterCursor }),
+          }),
+          limitInput,
+        );
         inspected = page.records.length;
         nextAdapterCursor = page.nextCursor;
-        for (const row of page.records) {
-          const proof = row.value;
+        for (const rawRow of page.records) {
+          let row: SafePasskeyScanRecord;
+          let proof: RegistrationProofRecord;
+          try {
+            ({ row, value: proof } = decodePasskeyScanRecord(
+              rawRow,
+              registrationProofsCollection,
+            ));
+            await assertCredentialOwner(proof);
+          } catch {
+            rejected += 1;
+            continue;
+          }
           const expiresAt =
             proof.expiresAt ??
             after(
@@ -1757,14 +2031,28 @@ export function createPasskeyService(
           }
         }
       } else if (stage === "indexes") {
-        const page = await credentials.scan({
-          limit: limitInput,
-          ...(adapterCursor === undefined ? {} : { cursor: adapterCursor }),
-        });
+        const page = passkeyScanPage(
+          await credentialIndexScan.scan({
+            limit: limitInput,
+            ...(adapterCursor === undefined ? {} : { cursor: adapterCursor }),
+          }),
+          limitInput,
+        );
         inspected = page.records.length;
         nextAdapterCursor = page.nextCursor;
-        for (const row of page.records) {
-          const index = row.value;
+        for (const rawRow of page.records) {
+          let row: SafePasskeyScanRecord;
+          let index: CredentialIndexRecord;
+          try {
+            ({ row, value: index } = decodePasskeyScanRecord(
+              rawRow,
+              credentialIndexesCollection,
+            ));
+            await assertCredentialOwner(index);
+          } catch {
+            rejected += 1;
+            continue;
+          }
           if (index.state !== "revoked") {
             continue;
           }
@@ -1814,14 +2102,28 @@ export function createPasskeyService(
           }
         }
       } else if (stage === "mirrors") {
-        const page = await passkeys.scan({
-          limit: limitInput,
-          ...(adapterCursor === undefined ? {} : { cursor: adapterCursor }),
-        });
+        const page = passkeyScanPage(
+          await passkeyMirrorScan.scan({
+            limit: limitInput,
+            ...(adapterCursor === undefined ? {} : { cursor: adapterCursor }),
+          }),
+          limitInput,
+        );
         inspected = page.records.length;
         nextAdapterCursor = page.nextCursor;
-        for (const row of page.records) {
-          const mirror = row.value;
+        for (const rawRow of page.records) {
+          let row: SafePasskeyScanRecord;
+          let mirror: PasskeyRecord;
+          try {
+            ({ row, value: mirror } = decodePasskeyScanRecord(
+              rawRow,
+              passkeysCollection,
+            ));
+            await assertCredentialOwner(mirror);
+          } catch {
+            rejected += 1;
+            continue;
+          }
           if (mirror.state !== "revoked") {
             continue;
           }
@@ -1852,15 +2154,28 @@ export function createPasskeyService(
           }
         }
       } else {
-        const page = await principals.scan({
-          limit: limitInput,
-          ...(adapterCursor === undefined ? {} : { cursor: adapterCursor }),
-        });
+        const page = passkeyScanPage(
+          await passkeyPrincipalScan.scan({
+            limit: limitInput,
+            ...(adapterCursor === undefined ? {} : { cursor: adapterCursor }),
+          }),
+          limitInput,
+        );
         inspected = page.records.length;
         nextAdapterCursor = page.nextCursor;
-        for (const row of page.records) {
-          const current = row.value;
-          await assertPrincipalStateOwner(current);
+        for (const rawRow of page.records) {
+          let row: SafePasskeyScanRecord;
+          let current: PasskeyPrincipalRecord;
+          try {
+            ({ row, value: current } = decodePasskeyScanRecord(
+              rawRow,
+              passkeyPrincipalsCollection,
+            ));
+            await assertPrincipalStateOwner(current);
+          } catch {
+            rejected += 1;
+            continue;
+          }
           const retained: PasskeySlot[] = [];
           for (const slot of current.slots) {
             if (
@@ -1934,6 +2249,7 @@ export function createPasskeyService(
         deletedProofs,
         deletedTombstones,
         releasedReservations,
+        rejected,
         cursor,
         hasMore: cursor !== null,
       });
